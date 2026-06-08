@@ -1,0 +1,13 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Large installers/packages
+*.whl
+Miniconda3-latest-Linux-x86_64.sh
+
+# Videos
+*.mp4
+
+# Optional generated data
+data/arm_tracking/*.mp4
