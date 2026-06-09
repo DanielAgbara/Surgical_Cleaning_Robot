@@ -10,25 +10,22 @@ from pathlib import Path
 # Project paths
 # --------------------------------------------------
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path("/home/agbara-admin/Documents/Surgical_Cleaning_Robot/robot_control")
 IK_PATH = ROOT / "IK"
+UTIL_PATH = ROOT / "Util"
 
+sys.path.insert(0, str(UTIL_PATH))
 sys.path.insert(0, str(IK_PATH))
-
-# --------------------------------------------------
-# Robot / kinematics imports
-# --------------------------------------------------
 
 from robot import SOArm101, S_list, M
 from jacobian import body_jacobian, damped_least_square_inverse, space_jacobian
 from se3 import adjoint_transform_list
-
 # --------------------------------------------------
 # Files
 # --------------------------------------------------
 
 VELOCITY_JSON = Path(
-    "/home/agbara-admin/Documents/Cleaning_Robot/data/arm_tracking/arm_velocity_tracking.json"
+    "/home/agbara-admin/Documents/Surgical_Cleaning_Robot/data/arm_tracking/arm_velocity_tracking.json"
 )
 
 # --------------------------------------------------
