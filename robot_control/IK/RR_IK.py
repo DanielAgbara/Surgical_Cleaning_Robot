@@ -12,9 +12,9 @@ Secondary task:
 """
 
 import numpy as np
-from fk import *
-from se3 import *
-from jacobian import *
+from robot_control.utilities.fk import *
+from robot_control.utilities.se3 import *
+from robot_control.utilities.jacobian import *
 
 
 def finite_difference_grad(w_func, theta, eps=1e-6):

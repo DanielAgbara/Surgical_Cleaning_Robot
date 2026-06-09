@@ -11,3 +11,10 @@ Miniconda3-latest-Linux-x86_64.sh
 
 # Optional generated data
 data/arm_tracking/*.mp4
+
+# Private keys
+calibration/private_key
+calibration/private_key.pub
+*.pem
+*.key
+id_rsa*

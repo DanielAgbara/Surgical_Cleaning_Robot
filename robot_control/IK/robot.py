@@ -1,10 +1,10 @@
 import time
 
 import numpy as np
-from fk import *
-from se3 import *
-from jacobian import *
-from so3 import *
+from robot_control.utilities.fk import *
+from robot_control.utilities.se3 import *
+from robot_control.utilities.jacobian import *
+from robot_control.utilities.so3 import *
 from typing import Callable
 from RR_IK import *
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig

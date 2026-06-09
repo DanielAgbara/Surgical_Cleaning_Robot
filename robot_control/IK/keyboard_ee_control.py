@@ -5,8 +5,8 @@ import curses
 import numpy as np
 
 import robot as bot
-from jacobian import body_jacobian, space_jacobian, damped_least_square_inverse
-from se3 import adjoint_transform_list
+from robot_control.utilities.jacobian import body_jacobian, space_jacobian, damped_least_square_inverse
+from robot_control.utilities.se3 import adjoint_transform_list
 
 
 # -----------------------------
@@ -88,7 +88,7 @@ def theta_to_action(theta_rad):
 
 
 def fk_position(arm, theta_rad):
-    from fk import space_product_of_exponentials
+    from robot_control.utilities.fk import space_product_of_exponentials
 
     T = space_product_of_exponentials(
         arm.M,

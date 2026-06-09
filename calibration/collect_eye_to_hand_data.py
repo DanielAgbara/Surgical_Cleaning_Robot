@@ -17,7 +17,7 @@ from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 # Project paths
 # ============================================================
 
-ROOT = Path("/home/agbara-admin/Documents/Cleaning_Robot")
+ROOT = Path("/home/agbara-admin/Documents/Surgical_Cleaning_Robot")
 IK_PATH = ROOT / "robot_control" / "IK"
 sys.path.append(str(IK_PATH))
 

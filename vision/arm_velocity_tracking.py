@@ -13,7 +13,7 @@ from ZED_bodytracking import (
     draw_arm_points_and_lines,
 )
 
-ROOT = Path("/home/agbara-admin/Documents/Cleaning_Robot")
+ROOT = Path("/home/agbara-admin/Documents/Surgical_Cleaning_Robot")
 IK_PATH = ROOT / "robot_control" / "IK"
 DATA_PATH = ROOT / "data" / "arm_tracking"
 
