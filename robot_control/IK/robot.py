@@ -1,13 +1,26 @@
 import time
 
 import numpy as np
-from robot_control.utilities.fk import *
-from robot_control.utilities.se3 import *
-from robot_control.utilities.jacobian import *
-from robot_control.utilities.so3 import *
 from typing import Callable
 from RR_IK import *
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
+import time
+
+import numpy as np
+from typing import Callable
+from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+UTIL_PATH = ROOT / "Util"
+
+sys.path.insert(0, str(UTIL_PATH))
+
+from fk import *
+from se3 import *
+from jacobian import *
+from so3 import *
 
 """
 This file contains the description of the robot.

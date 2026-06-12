@@ -13,6 +13,7 @@ from ZED_bodytracking import (
     draw_arm_points_and_lines,
 )
 
+
 # ============================================================
 # File paths
 # ============================================================
@@ -22,224 +23,24 @@ ROOT = Path("/home/agbara-admin/Documents/Surgical_Cleaning_Robot")
 DATA_PATH = ROOT / "data" / "arm_tracking"
 DATA_PATH.mkdir(parents=True, exist_ok=True)
 
-OUTPUT_TXT = DATA_PATH / "wrist_delta_output.txt"
-OUTPUT_JSON = DATA_PATH / "robot_command_delta.json"
+VIDEO_PATH = ROOT / "data" / "Video"
+VIDEO_PATH.mkdir(parents=True, exist_ok=True)
 
-#Output
+OUTPUT_JSON = DATA_PATH / "raw_arm_tracking.json"
+
+VIDEO_OUTPUT = VIDEO_PATH / "motion_capture_recording.mp4"
 
 
 # ============================================================
 # Settings
 # ============================================================
 
-DEADBAND_MM = 20
-ARM_LENGTH_DB_F_MM = 100
-ARM_LENGTH_DB_B_MM = 50
-# How often to output delta data after reference is collected
-OUTPUT_INTERVAL = 0.1  # seconds
-NUM_REFERENCE_FRAMES = 30 #number of frame collected for the reference data
+OUTPUT_INTERVAL = 0.1
+NUM_REFERENCE_FRAMES = 30
+ARM_TO_TRACK = "left"
 
-
-def apply_body_tracking_DB(keypoint_pos, previous_keypoint_pos):
-    """
-    Apply deadband to a body-tracking keypoint.
-
-    If the current keypoint movement is smaller than DEADBAND_MM
-    along an axis, that axis keeps its previous value.
-
-    This helps reduce small ZED body-tracking jitter.
-
-    Parameters
-    ----------
-    keypoint_pos : np.ndarray, shape (3,)
-        Current keypoint position [x, y, z] in camera frame.
-
-    previous_keypoint_pos : np.ndarray, shape (3,)
-        Previous keypoint position [x, y, z] in camera frame.
-
-    Returns
-    -------
-    keypoint_pos_DB : np.ndarray, shape (3,)
-        Deadband-filtered keypoint position.
-    """
-
-    keypoint_pos = np.asarray(keypoint_pos, dtype=float).reshape(3)
-    previous_keypoint_pos = np.asarray(previous_keypoint_pos, dtype=float).reshape(3)
-
-    keypoint_pos_DB = keypoint_pos.copy()
-
-    for i in range(len(keypoint_pos)):
-        if np.abs(keypoint_pos[i] - previous_keypoint_pos[i]) < DEADBAND_MM:
-            keypoint_pos_DB[i] = previous_keypoint_pos[i]
-
-    return keypoint_pos_DB
-
-def get_arm_length(shoulder_ref, wrist_ref):
-    """
-    Compute reference arm length using full 3D distance.
-
-    This is better than using only x because the arm can move
-    left/right/up/down while keeping roughly the same true length.
-    """
-
-    shoulder_ref = np.asarray(shoulder_ref, dtype=float).reshape(3)
-    wrist_ref = np.asarray(wrist_ref, dtype=float).reshape(3)
-
-    arm_vector = wrist_ref - shoulder_ref
-    arm_length = np.linalg.norm(arm_vector)
-
-    return arm_length
-
-
-def apply_DB_armlength(robot_delta,
-                       current_wrist_pos,
-                       current_shoulder_pos,
-                       ref_arm_length):
-    """
-    Suppress false forward/backward robot motion when current arm length
-    is close to the reference arm length.
-
-    robot_delta[0] is assumed to be forward/backward motion.
-    """
-
-    robot_delta = np.asarray(robot_delta, dtype=float).reshape(3)
-    current_wrist_pos = np.asarray(current_wrist_pos, dtype=float).reshape(3)
-    current_shoulder_pos = np.asarray(current_shoulder_pos, dtype=float).reshape(3)
-
-    robot_delta_DB = robot_delta.copy()
-
-    current_arm_length = get_arm_length(
-        current_shoulder_pos,
-        current_wrist_pos
-    )
-
-    arm_length_error = current_arm_length - ref_arm_length
-
-    # Deadband region:
-    #   small shortening:  -ARM_LENGTH_DB_B_MM
-    #   small extension:  +ARM_LENGTH_DB_F_MM
-    if -ARM_LENGTH_DB_B_MM < arm_length_error < ARM_LENGTH_DB_F_MM:
-        robot_delta_DB[0] = 0.0
-
-    return robot_delta_DB
-
-def get_T_robot_camera():
-    """
-    Build the homogeneous transform from camera frame to robot frame.
-
-    Camera frame:
-        X = Right
-        Y = Down
-        Z = Forward
-
-    Robot frame:
-        X_robot =  X_camera
-        Y_robot = -Z_camera
-        Z_robot = -Y_camera
-
-    This gives:
-
-        x_robot =  x_camera
-        y_robot = -z_camera
-        z_robot = -y_camera
-
-    Returns
-    -------
-    T_robot_camera : np.ndarray, shape (4, 4)
-        Homogeneous transform from camera frame to robot frame.
-    """
-
-    R_robot_camera = np.array([
-        [1.0,  0.0,  0.0],
-        [0.0,  0.0, 1.0],
-        [0.0, -1.0,  0.0]
-    ])
-
-    T_robot_camera = np.eye(4)
-    T_robot_camera[:3, :3] = R_robot_camera
-
-    return T_robot_camera
-
-
-def apply_T(pos, T):
-    """
-    Transform a 3D point from camera frame to robot frame.
-
-    This is for actual positions/points, not pure displacement vectors.
-
-    Parameters
-    ----------
-    pos : array-like, shape (3,)
-        Position in camera frame [x, y, z].
-
-    T : np.ndarray, shape (4, 4)
-        Homogeneous transform.
-
-    Returns
-    -------
-    pos_robot : np.ndarray, shape (3,)
-        Position in robot frame [x, y, z].
-    """
-
-    pos = np.asarray(pos, dtype=float).reshape(3)
-
-    pos_h = np.append(pos, 1.0)
-
-    pos_robot_h = T @ pos_h
-
-    return pos_robot_h[:3]
-
-
-def cal_wrist_delta(current_shoulder_pos, current_wrist_pos,
-                    prev_shoulder_pos, prev_wrist_pos, T):
-    """
-    Calculate wrist displacement relative to the shoulder.
-
-    Steps:
-        1. Apply deadband to current shoulder and wrist positions.
-        2. Compute current wrist vector relative to shoulder.
-        3. Compute previous wrist vector relative to shoulder.
-        4. Subtract previous relative vector from current relative vector.
-        5. Rotate the delta from camera frame to robot frame.
-
-    Using wrist relative to shoulder helps reduce errors caused by
-    whole-body drift or small camera/body-tracking shifts.
-
-    Inputs are assumed to be in millimeters.
-    """
-
-    current_shoulder_pos = np.asarray(current_shoulder_pos, dtype=float).reshape(3)
-    current_wrist_pos = np.asarray(current_wrist_pos, dtype=float).reshape(3)
-
-    prev_shoulder_pos = np.asarray(prev_shoulder_pos, dtype=float).reshape(3)
-    prev_wrist_pos = np.asarray(prev_wrist_pos, dtype=float).reshape(3)
-
-    # Apply deadband to current measurements.
-    current_shoulder_pos_DB = apply_body_tracking_DB(
-        current_shoulder_pos,
-        prev_shoulder_pos
-    )
-
-    current_wrist_pos_DB = apply_body_tracking_DB(
-        current_wrist_pos,
-        prev_wrist_pos
-    )
-
-    # Current wrist position relative to current shoulder.
-    current_wrist_rel = current_wrist_pos_DB - current_shoulder_pos_DB
-
-    # Previous wrist position relative to previous shoulder.
-    prev_wrist_rel = prev_wrist_pos - prev_shoulder_pos
-
-    # Delta in camera frame.
-    delta_camera = current_wrist_rel - prev_wrist_rel
-
-    # Since this is a displacement/vector, use rotation only.
-    R_robot_camera = T[:3, :3]
-
-    delta_robot = R_robot_camera @ delta_camera
-
-    return delta_robot
+ENABLE_VIDEO_RECORDING = True
+VIDEO_FPS = 30
 
 # ============================================================
 # Output Helper Functions
@@ -283,9 +84,13 @@ def describe_delta(delta_robot):
         f"went {z_dir} by {abs(dz):.2f} mm"
     )
 
+# ============================================================
+# Helper functions
+# ============================================================
+
 def make_json_safe(data):
     """
-    Convert numpy arrays/numpy numbers into JSON-safe Python objects.
+    Convert numpy arrays and numpy numbers to JSON-safe Python types.
     """
 
     if isinstance(data, np.ndarray):
@@ -298,95 +103,95 @@ def make_json_safe(data):
         return float(data)
 
     if isinstance(data, dict):
-        return {key: make_json_safe(value) for key, value in data.items()}
+        return {
+            key: make_json_safe(value)
+            for key, value in data.items()
+        }
 
     if isinstance(data, list):
-        return [make_json_safe(value) for value in data]
+        return [
+            make_json_safe(value)
+            for value in data
+        ]
 
     return data
 
 
-def write_output(
-    sample_number,
-    delta_robot_DB,
-    shoulder_pos,
-    wrist_pos,
-    current_arm_length,
-    command_records
-):
+def get_arm_length(shoulder_pos, wrist_pos):
     """
-    Write tracking data to txt and JSON.
-
-    JSON is for robot control.
-    TXT is for human-readable debugging.
+    Compute shoulder-to-wrist arm length using full 3D distance.
+    Units are the same as the ZED coordinate units.
     """
 
-    meaning = describe_delta(delta_robot_DB)
+    shoulder_pos = np.asarray(shoulder_pos, dtype=float).reshape(3)
+    wrist_pos = np.asarray(wrist_pos, dtype=float).reshape(3)
 
-    command_record = {
-        "time_step": sample_number,
+    return np.linalg.norm(wrist_pos - shoulder_pos)
 
-        "current_shoulder_position_mm": shoulder_pos,
-        "current_wrist_position_mm": wrist_pos,
-        "current_arm_length_mm": current_arm_length,
 
-        "delta_robot_mm": delta_robot_DB,
+def save_raw_json(reference_data, records):
+    """
+    Save reference data and raw tracking records to JSON.
+    """
 
-        # This is the value your robot-control script can read.
-        # Convert to meters there or here depending on your IK code.
-        "robot_command": {
-            "type": "cartesian_delta",
-            "frame": "robot",
-            "units": "mm",
-            "linear_delta": delta_robot_DB,
-            "angular_delta": [0.0, 0.0, 0.0]
-        },
-
-        "meaning": meaning
+    output = {
+        "description": "Raw unfiltered arm tracking data",
+        "units": "millimeters",
+        "coordinate_system": "ZED IMAGE frame",
+        "arm_tracked": ARM_TO_TRACK,
+        "output_interval_s": OUTPUT_INTERVAL,
+        "num_reference_frames": NUM_REFERENCE_FRAMES,
+        "reference_data": reference_data,
+        "records": records,
     }
-
-    command_records.append(command_record)
-
-    output_text = (
-        f"\nTime: {sample_number}\n"
-        f"Current Shoulder Position: {shoulder_pos.tolist()}\n"
-        f"Current Wrist Position: {wrist_pos.tolist()}\n"
-        f"Current Arm Length: {current_arm_length:.2f} mm\n"
-        f"Delta Robot DB: {delta_robot_DB.tolist()}\n"
-        f"Meaning: {meaning}\n"
-    )
-
-    with open(OUTPUT_TXT, "a") as f:
-        f.write(output_text)
 
     with open(OUTPUT_JSON, "w") as f:
         json.dump(
-            make_json_safe({
-                "units": "mm",
-                "command_type": "cartesian_delta",
-                "frame": "robot",
-                "records": command_records
-            }),
+            make_json_safe(output),
             f,
             indent=4
         )
 
-    return output_text
+
+# ============================================================
+# Main function
+# ============================================================
 
 def main():
-    with open(OUTPUT_TXT, "w") as f:
-        f.write("Wrist Delta Output\n")
-        f.write("==================\n")
-        f.write(f"Deadband: {DEADBAND_MM} mm\n")
-        f.write(f"Output interval: {OUTPUT_INTERVAL} seconds\n")
-        f.write(f"Reference frames: {NUM_REFERENCE_FRAMES}\n\n")
+    """
+    Raw arm tracking data collection.
+
+    ENTER:
+        Collect reference position over NUM_REFERENCE_FRAMES frames.
+        The averaged reference becomes the first previous position.
+
+    q:
+        Quit.
+
+    After reference:
+        Saves raw unfiltered data blocks:
+
+            time block
+            shoulder position
+            wrist position
+            change in wrist position from previous
+            change in shoulder position from previous
+            arm length
+    """
 
     zed = sl.Camera()
 
     init_params = sl.InitParameters()
     init_params.camera_resolution = sl.RESOLUTION.HD720
     init_params.camera_fps = 30
+
+    # Raw body keypoints will be in millimeters.
     init_params.coordinate_units = sl.UNIT.MILLIMETER
+
+    # ZED IMAGE frame:
+    #   X = image right
+    #   Y = image down
+    #   Z = forward/depth
     init_params.coordinate_system = sl.COORDINATE_SYSTEM.IMAGE
 
     err = zed.open(init_params)
@@ -396,42 +201,64 @@ def main():
         return
 
     print("Camera opened!")
-    print(f"Writing wrist delta output to: {OUTPUT_TXT}")
+    print(f"Saving raw tracking JSON to: {OUTPUT_JSON}")
 
     try:
-        #Setting up body tracking
         body_runtime = setup_body_tracking(zed)
 
         image = sl.Mat()
         bodies = sl.Bodies()
         runtime = sl.RuntimeParameters()
 
-        window_name = "Arm Motion Tracking"
+        window_name = "Raw Arm Tracking"
         cv.namedWindow(window_name, cv.WINDOW_NORMAL)
 
-        T_robot_camera = get_T_robot_camera()
+        # --------------------------------------------------------
+        # Reference collection state
+        # --------------------------------------------------------
 
-        reference_collected = False
         collecting_reference = False
+        reference_collected = False
 
-        reference_arm_length = None
+        shoulder_ref_samples = []
+        wrist_ref_samples = []
+
+        reference_data = None
+
+        # --------------------------------------------------------
+        # Previous position state
+        # --------------------------------------------------------
 
         prev_shoulder_pos = None
         prev_wrist_pos = None
 
-        shoulder_ref_samples = []
-        wrist_ref_samples = []
-        command_records = []
+        # --------------------------------------------------------
+        # Output state
+        # --------------------------------------------------------
 
-        latest_arm_data = None
-
-        last_output_time = time.time()
+        records = []
         sample_number = 0
+        start_time = None
+        last_output_time = time.time()
+                
+        # --------------------------------------------------------
+        # Video recording state
+        # --------------------------------------------------------
+
+        video_writer = None
+        video_recording_started = False
+
+        # Create empty JSON at startup.
+        save_raw_json(reference_data, records)
 
         print("Press ENTER to collect reference position.")
         print("Press q to quit.")
 
         while True:
+            # ----------------------------------------------------
+            # Grab frame
+            # ----------------------------------------------------
+
             if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
                 continue
 
@@ -441,36 +268,55 @@ def main():
             if frame.shape[2] == 4:
                 frame = cv.cvtColor(frame, cv.COLOR_BGRA2BGR)
 
+            # ----------------------------------------------------
+            # Retrieve body tracking
+            # ----------------------------------------------------
+
             zed.retrieve_bodies(bodies, body_runtime)
 
-            body = get_single_body(bodies, mode="closest")
+            body = get_single_body(
+                bodies,
+                mode="closest"
+            )
 
-            latest_arm_data = None
+            arm_data = None
             shoulder_pos = None
             wrist_pos = None
 
             if body is not None:
-                latest_arm_data = get_arm_points(body, arm="right")
+                arm_data = get_arm_points(
+                    body,
+                    arm=ARM_TO_TRACK
+                )
 
-            if latest_arm_data is not None:
-                frame = draw_arm_points_and_lines(frame, latest_arm_data)
+            if arm_data is not None:
+                frame = draw_arm_points_and_lines(
+                    frame,
+                    arm_data
+                )
 
                 shoulder_pos = np.asarray(
-                    latest_arm_data["shoulder_3d"],
+                    arm_data["shoulder_3d"],
                     dtype=float
                 ).reshape(3)
 
                 wrist_pos = np.asarray(
-                    latest_arm_data["wrist_3d"],
+                    arm_data["wrist_3d"],
                     dtype=float
                 ).reshape(3)
 
-                # --------------------------------------------------
-                # Collect multiple reference frames
-                # --------------------------------------------------
+                # ------------------------------------------------
+                # Collect averaged reference
+                # ------------------------------------------------
+
                 if collecting_reference:
-                    shoulder_ref_samples.append(shoulder_pos.copy())
-                    wrist_ref_samples.append(wrist_pos.copy())
+                    shoulder_ref_samples.append(
+                        shoulder_pos.copy()
+                    )
+
+                    wrist_ref_samples.append(
+                        wrist_pos.copy()
+                    )
 
                     count = len(wrist_ref_samples)
 
@@ -496,85 +342,117 @@ def main():
                             axis=0
                         )
 
-                        reference_collected = True
-                        collecting_reference = False
-                        sample_number = 0
+                        reference_arm_length = get_arm_length(
+                            shoulder_ref,
+                            wrist_ref
+                        )
 
-                        # Averaged reference becomes first previous position
+                        reference_data = {
+                            "reference_method": "average_of_multiple_frames",
+                            "num_reference_frames": NUM_REFERENCE_FRAMES,
+                            "shoulder_position_mm": shoulder_ref,
+                            "wrist_position_mm": wrist_ref,
+                            "arm_length_mm": reference_arm_length,
+                        }
+
+                        # Averaged reference becomes first previous position.
                         prev_shoulder_pos = shoulder_ref.copy()
                         prev_wrist_pos = wrist_ref.copy()
 
-                        reference_arm_length = get_arm_length(
-                            prev_shoulder_pos,
-                            prev_wrist_pos
+                        collecting_reference = False
+                        reference_collected = True
+
+                        records.clear()
+                        sample_number = 0
+                        start_time = time.time()
+                        last_output_time = start_time
+
+                        save_raw_json(
+                            reference_data,
+                            records
                         )
 
-                        last_output_time = time.time()
+                        print("\nReference collected.")
+                        print("Reference shoulder:", shoulder_ref)
+                        print("Reference wrist:", wrist_ref)
+                        print(f"Reference arm length: {reference_arm_length:.2f} mm")
 
-                        reference_text = (
-                            "\nReference collected from averaged frames.\n"
-                            f"Number of frames: {NUM_REFERENCE_FRAMES}\n"
-                            f"Reference shoulder: {prev_shoulder_pos.tolist()}\n"
-                            f"Reference wrist: {prev_wrist_pos.tolist()}\n"
-                            f"Reference arm length: {reference_arm_length:.2f} mm\n"
-                        )
+                # ------------------------------------------------
+                # Save raw measurement blocks after reference
+                # ------------------------------------------------
 
-                        print(reference_text)
-
-                        with open(OUTPUT_TXT, "a") as f:
-                            f.write(reference_text)
-
-                # --------------------------------------------------
-                # Track after reference is collected
-                # --------------------------------------------------
                 elif reference_collected:
                     current_time = time.time()
 
                     if current_time - last_output_time >= OUTPUT_INTERVAL:
-                        delta_robot = cal_wrist_delta(
-                            shoulder_pos,
-                            wrist_pos,
-                            prev_shoulder_pos,
-                            prev_wrist_pos,
-                            T_robot_camera
-                        )
+                        sample_number += 1
 
-                        delta_robot_DB = apply_DB_armlength(
-                            delta_robot,
-                            wrist_pos,
-                            shoulder_pos,
-                            reference_arm_length
-                        )
+                        elapsed_time = current_time - start_time
 
                         current_arm_length = get_arm_length(
                             shoulder_pos,
                             wrist_pos
                         )
 
-                        sample_number += OUTPUT_INTERVAL
-
-                        output_text = write_output(
-                            sample_number,
-                            delta_robot_DB,
-                            shoulder_pos,
-                            wrist_pos,
-                            current_arm_length,
-                            command_records
+                        wrist_delta_from_previous = (
+                            wrist_pos - prev_wrist_pos
                         )
 
-                        print(output_text)
+                        shoulder_delta_from_previous = (
+                            shoulder_pos - prev_shoulder_pos
+                        )
 
+                        record = {
+                            "sample": sample_number,
+
+                            "time": {
+                                "elapsed_s": elapsed_time,
+                                "timestamp_s": current_time,
+                            },
+
+                            "shoulder_position_mm": shoulder_pos,
+                            "wrist_position_mm": wrist_pos,
+
+                            "change_from_previous": {
+                                "wrist_delta_mm": wrist_delta_from_previous,
+                                "shoulder_delta_mm": shoulder_delta_from_previous,
+                            },
+
+                            "arm_length_mm": current_arm_length,
+                        }
+
+                        records.append(record)
+
+                        save_raw_json(
+                            reference_data,
+                            records
+                        )
+
+                        print(
+                            f"\nTime block: {sample_number}\n"
+                            f"Shoulder: {shoulder_pos.tolist()}\n"
+                            f"Wrist: {wrist_pos.tolist()}\n"
+                            f"Wrist delta: {wrist_delta_from_previous.tolist()}\n"
+                            f"Shoulder delta: {shoulder_delta_from_previous.tolist()}\n"
+                            f"Arm length: {current_arm_length:.2f} mm"
+                        )
+
+                        # Current raw measurements become previous raw measurements.
                         prev_shoulder_pos = shoulder_pos.copy()
                         prev_wrist_pos = wrist_pos.copy()
 
                         last_output_time = current_time
+
+            # ----------------------------------------------------
+            # Display status
+            # ----------------------------------------------------
 
             if collecting_reference:
                 status_text = "Collecting reference | Keep arm still"
                 status_color = (0, 255, 255)
 
             elif reference_collected:
-                status_text = "Reference collected | Tracking wrist delta"
+                status_text = "Reference collected | Recording raw data"
                 status_color = (0, 255, 0)
 
             else:
@@ -603,18 +481,59 @@ def main():
                 cv.LINE_AA
             )
 
-            cv.imshow(window_name, frame)
+            # ----------------------------------------------------
+            # Video recording
+            # ----------------------------------------------------
+            # Records the displayed frame with arm tracking visuals.
+            # The video starts only after reference is collected,
+            # so the recording corresponds to actual motion capture.
+
+            if ENABLE_VIDEO_RECORDING and reference_collected:
+
+                if video_writer is None:
+                    frame_height, frame_width = frame.shape[:2]
+
+                    fourcc = cv.VideoWriter_fourcc(*"mp4v")
+
+                    video_writer = cv.VideoWriter(
+                        str(VIDEO_OUTPUT),
+                        fourcc,
+                        VIDEO_FPS,
+                        (frame_width, frame_height)
+                    )
+
+                    video_recording_started = True
+
+                    print(f"Video recording started: {VIDEO_OUTPUT}")
+
+                video_writer.write(frame)
+            
+            cv.imshow(
+                window_name,
+                frame
+            )
 
             key = cv.waitKey(1) & 0xFF
+
+            # ----------------------------------------------------
+            # Quit
+            # ----------------------------------------------------
 
             if key == ord("q"):
                 break
 
-            if cv.getWindowProperty(window_name, cv.WND_PROP_VISIBLE) < 1:
+            if cv.getWindowProperty(
+                window_name,
+                cv.WND_PROP_VISIBLE
+            ) < 1:
                 break
 
+            # ----------------------------------------------------
+            # ENTER starts reference collection
+            # ----------------------------------------------------
+
             if key in [10, 13]:
-                if latest_arm_data is None:
+                if arm_data is None:
                     print("No valid right arm detected. Cannot collect reference.")
                     continue
 
@@ -624,12 +543,24 @@ def main():
                 shoulder_ref_samples.clear()
                 wrist_ref_samples.clear()
 
+                reference_data = None
+                records.clear()
+
+                prev_shoulder_pos = None
+                prev_wrist_pos = None
+
+                save_raw_json(
+                    reference_data,
+                    records
+                )
+
                 print(f"Collecting {NUM_REFERENCE_FRAMES} reference frames...")
 
     finally:
         cv.destroyAllWindows()
         zed.close()
         print("Program closed.")
+
 
 if __name__ == "__main__":
     main()

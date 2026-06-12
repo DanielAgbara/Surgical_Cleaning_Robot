@@ -12,9 +12,18 @@ Secondary task:
 """
 
 import numpy as np
-from robot_control.utilities.fk import *
-from robot_control.utilities.se3 import *
-from robot_control.utilities.jacobian import *
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+UTIL_PATH = ROOT / "Util"
+
+sys.path.insert(0, str(UTIL_PATH))
+
+from fk import *
+from se3 import *
+from jacobian import *
+from so3 import *
 
 
 def finite_difference_grad(w_func, theta, eps=1e-6):
