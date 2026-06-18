@@ -115,7 +115,7 @@ PLANE_RANSAC_ITERATIONS = 1000
 MAX_OBJECT_PLANE_POINTS = 60000
 
 # Detectron2 threshold
-DETECTION_THRESHOLD = 0.5
+DETECTION_THRESHOLD = 0.3
 
 
 # ============================================================
