@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parent
 MODEL_DIR = ROOT / "output" / "maskrcnn_tray"
 
 CONFIG_PATH = MODEL_DIR / "config.yaml"
-MODEL_PATH = MODEL_DIR / "model_0000499.pth"
+MODEL_PATH = MODEL_DIR / "model_0001499.pth"
 
 
 # --------------------------------------------------
