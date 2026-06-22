@@ -7,12 +7,26 @@ from detectron2.config import get_cfg
 from detectron2.engine import DefaultPredictor
 from detectron2 import model_zoo
 from detectron2.data import MetadataCatalog
+from pathlib import Path
+
 
 
 def setup_detectron2(detection_threshold=0.5):
     """
-    Load Detectron2 Mask R-CNN.
+    Load fine-tuned Detectron2 Mask R-CNN model.
     """
+
+    ROOT = Path(
+        "/home/agbara-admin/Documents/Surgical_Cleaning_Robot"
+    )
+
+    MODEL_WEIGHTS = (
+        ROOT /
+        "Fine_Tuning" /
+        "output" / 
+        "maskrcnn_tray" /
+        "model_final.pth"
+    )
 
     cfg = get_cfg()
 
@@ -22,61 +36,53 @@ def setup_detectron2(detection_threshold=0.5):
         )
     )
 
-    cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url(
-        "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"
-    )
+    cfg.MODEL.WEIGHTS = str(MODEL_WEIGHTS)
+
+    cfg.MODEL.ROI_HEADS.NUM_CLASSES = 1
 
     cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = detection_threshold
-    cfg.MODEL.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+    cfg.MODEL.DEVICE = (
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
 
     predictor = DefaultPredictor(cfg)
 
-    metadata = MetadataCatalog.get(cfg.DATASETS.TRAIN[0])
-    class_names = metadata.thing_classes
-
     print(f"[INFO] Detectron2 loaded on {cfg.MODEL.DEVICE}")
+    print(f"[INFO] Weights: {MODEL_WEIGHTS}")
 
-    return predictor, metadata, class_names
+    return predictor
 
 
-def detect_object(frame_bgr, predictor, class_names, object_name):
+def detect_object(frame_bgr, predictor, object_name="tray"):
     """
-    Detect only the requested object.
+    Detect tray using fine-tuned one-class Mask R-CNN model.
 
-    If object_name is not detected, return None.
-    Other detected objects are ignored.
+    Since the fine-tuned model only has one class, we do not use
+    COCO class_names anymore.
     """
 
     outputs = predictor(frame_bgr)
     instances = outputs["instances"].to("cpu")
 
+    if len(instances) == 0:
+        return None
+
     if not instances.has("pred_masks"):
         return None
 
-    pred_classes = instances.pred_classes.numpy()
     scores = instances.scores.numpy()
     masks = instances.pred_masks.numpy()
 
-    best_idx = None
-    best_score = -1.0
-
-    for i, class_id in enumerate(pred_classes):
-        detected_name = class_names[int(class_id)]
-
-        if detected_name.lower() == object_name.lower():
-            if scores[i] > best_score:
-                best_score = scores[i]
-                best_idx = i
-
-    if best_idx is None:
-        return None
+    best_idx = int(np.argmax(scores))
 
     return {
         "class_name": object_name,
         "score": float(scores[best_idx]),
         "mask": masks[best_idx].astype(bool),
     }
-
 
 def get_valid_xyz_from_mask(xyz, mask):
     """

@@ -88,8 +88,8 @@ DATA_PATH.mkdir(parents=True, exist_ok=True)
 VIDEO_PATH = ROOT / "data" / "Video"
 VIDEO_PATH.mkdir(parents=True, exist_ok=True)
 
-OUTPUT_JSON = DATA_PATH / "sink_arm_tracking_raw.json"
-VIDEO_OUTPUT = VIDEO_PATH / "sink_arm_tracking_recording.mp4"
+OUTPUT_JSON = DATA_PATH / "tray_arm_tracking_raw.json"
+VIDEO_OUTPUT = VIDEO_PATH / "tray_arm_tracking_recording.mp4"
 
 
 # ============================================================
@@ -97,25 +97,45 @@ VIDEO_OUTPUT = VIDEO_PATH / "sink_arm_tracking_recording.mp4"
 # ============================================================
 
 ARM_TO_TRACK = "right"
-OBJECT_NAME_TO_TRACK = "sink"
+OBJECT_NAME_TO_TRACK = "tray"
 
-OUTPUT_INTERVAL = 0.1
-NUM_REFERENCE_FRAMES = 30
+# ------------------------------------------------------------
+# Main timing control
+# ------------------------------------------------------------
+# Change only this value.
+# Everything else below updates automatically.
+#
+# For offline human demonstration learning:
+#   5 FPS is okay because the camera is stationary.
+#
+# For future real-time teleoperation:
+#   use 15 or 30 FPS.
+# ------------------------------------------------------------
+
+CAMERA_FPS = 5
+
+# Record one sample per camera frame.
+OUTPUT_INTERVAL = 1.0 / CAMERA_FPS
+
+# Collect one second of reference data.
+NUM_REFERENCE_FRAMES = CAMERA_FPS
 
 ENABLE_VIDEO_RECORDING = False
-VIDEO_FPS = 30
 
-# ZED units are millimeters in this script
+# Match saved video FPS to camera FPS.
+VIDEO_FPS = CAMERA_FPS
+
+# ZED units are millimeters in this script.
 HAND_TO_OBJECT_CLOSE_DISTANCE_MM = 500.0
 
-# Plane fitting settings
+# Plane fitting settings.
 PLANE_DISTANCE_THRESHOLD_MM = 15.0
 PLANE_RANSAC_POINTS = 3
 PLANE_RANSAC_ITERATIONS = 1000
 MAX_OBJECT_PLANE_POINTS = 60000
 
-# Detectron2 threshold
-DETECTION_THRESHOLD = 0.3
+# Detectron2 threshold.
+DETECTION_THRESHOLD = 0.95
 
 
 # ============================================================
@@ -200,7 +220,7 @@ def setup_zed():
 
     init_params = sl.InitParameters()
     init_params.camera_resolution = sl.RESOLUTION.HD720
-    init_params.camera_fps = 30
+    init_params.camera_fps = CAMERA_FPS
     init_params.depth_mode = sl.DEPTH_MODE.NEURAL
     init_params.coordinate_units = sl.UNIT.MILLIMETER
     init_params.coordinate_system = sl.COORDINATE_SYSTEM.IMAGE
@@ -238,18 +258,9 @@ def main():
         The JSON tells you whether the hand is close to the sink.
     """
 
-    predictor, metadata, class_names = setup_detectron2(
+    predictor = setup_detectron2(
         detection_threshold=DETECTION_THRESHOLD
     )
-
-    if OBJECT_NAME_TO_TRACK not in class_names:
-        print(
-            f"[WARNING] '{OBJECT_NAME_TO_TRACK}' is not a COCO class."
-        )
-        print(
-            "[WARNING] Default COCO Mask R-CNN may not detect sinks "
-            "unless you use a custom-trained model."
-        )
 
     zed, runtime = setup_zed()
     body_runtime = setup_body_tracking(zed)
@@ -258,7 +269,7 @@ def main():
     point_cloud_zed = sl.Mat()
     bodies = sl.Bodies()
 
-    window_name = "Sink Mask + Sink Plane + Arm Tracking"
+    window_name = "Tray Mask + Tray Plane + Arm Tracking"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     collecting_reference = False
@@ -328,9 +339,7 @@ def main():
 
             object_data = detect_object(
                 frame,
-                predictor,
-                class_names,
-                OBJECT_NAME_TO_TRACK
+                predictor
             )
 
             object_result = process_detected_object(
