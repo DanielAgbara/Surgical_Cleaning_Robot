@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Main script combining:
+data script combining:
 
 1. Object detection
    - Detect only the selected object, currently "sink"
@@ -29,10 +29,15 @@ import pyzed.sl as sl
 
 
 # ============================================================
+# Project Root
+# ============================================================
+ROOT = Path("/home/agbara-admin/Documents/Surgical_Cleaning_Robot")
+ROOT = Path(__file__).resolve().parent
+# ============================================================
 # Import project helpers
 # ============================================================
 
-from Object_Detection.helper import (
+from vision.Object_Detection.helper import (
     setup_detectron2,
     detect_object,
     process_detected_object,
@@ -40,7 +45,7 @@ from Object_Detection.helper import (
     draw_plane_pixels_on_object,
 )
 
-from Arm_Tracking.helper import (
+from vision.Arm_Tracking.helper import (
     euclidean_distance,
     extract_arm_positions,
     build_reference_data,
@@ -57,7 +62,7 @@ from Arm_Tracking.helper import (
 BODY_MODEL = 34   # Use 18 or 34
 
 if BODY_MODEL == 34:
-    from Arm_Tracking.body34 import (
+    from vision.Arm_Tracking.body34 import (
         setup_body_tracking,
         get_single_body,
         get_arm_points,
@@ -65,7 +70,7 @@ if BODY_MODEL == 34:
     )
 
 elif BODY_MODEL == 18:
-    from Arm_Tracking.body18 import (
+    from vision.Arm_Tracking.body18 import (
         setup_body_tracking,
         get_single_body,
         get_arm_points,
@@ -79,8 +84,6 @@ else:
 # ============================================================
 # Paths
 # ============================================================
-
-ROOT = Path("/home/agbara-admin/Documents/Surgical_Cleaning_Robot")
 
 DATA_PATH = ROOT / "data" / "arm_tracking"
 DATA_PATH.mkdir(parents=True, exist_ok=True)
