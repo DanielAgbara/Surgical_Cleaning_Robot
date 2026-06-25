@@ -18,13 +18,14 @@ if __name__ == "__main__":
     arm.move_to_home()
 
     # Desired end-effector position (x, y, z) in meters
-    p_des = np.array([0.430, 0.0, 0.1])  # Example desired position
+    p_des = np.array([0.33, 0.0, 0.05])  # Example desired position
 
     # Initial guess for joint angles (in degrees)
     theta_init = arm.get_joint_angles_deg()
     time.sleep(2)
     # Compute inverse kinematics to find joint angles that achieve the desired end-effector position
-    theta_solution = arm.solve_position(p_des, theta_init, max_iters= 100)
+    theta_solution = arm.solve_position(p_des, theta_init, max_iters= 500)
+    
 
     print("Desired end-effector position:", p_des)
     print("Computed joint angles (degrees):", theta_solution)
@@ -38,7 +39,7 @@ if __name__ == "__main__":
         "gripper.pos": theta_solution[5],
     }, max_step_deg=2.0, step_delay=0.05)
 
-    time.sleep(2)
+    time.sleep(5)
 
 
     arm.move_to_rest()

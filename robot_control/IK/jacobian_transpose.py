@@ -15,7 +15,7 @@ def jacobian_transpose_position(
     theta_init,
     p_des,
     max_iters=100,
-    tol_converge=1e-6,
+    tol_converge= 1e-3,
     q_min=None,
     q_max=None,
     K=None,

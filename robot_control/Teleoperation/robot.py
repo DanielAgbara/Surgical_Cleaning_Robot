@@ -61,7 +61,7 @@ q4 = np.array([0.225, 0, 0.228])
 w5 = np.array([1, 0, 0])
 q5 = np.array([0.289, 0, 0.228])
 
-w6 = np.array([0, 1, 0])
+w6 = np.array([0, -1, 0])
 q6 = np.array([0.326, 0, 0.228])
 
 
@@ -621,7 +621,7 @@ class SOArm101:
         p_des,
         theta_init=None,
         max_iters=100,
-        tol_converge=1e-4
+        tol_converge=2e-3
     ):
         """
         Solve IK for desired EE position.
