@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import sys
 import time
 import curses
 import json
@@ -11,15 +10,40 @@ import numpy as np
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
 
+# --------------------------------------------------
+# Paths
+# --------------------------------------------------
+
 ROOT = Path("/home/agbara-admin/Documents/Cleaning_Robot")
 POSE_FILE = ROOT / "data" / "current_robot_pose.json"
+
+
+# --------------------------------------------------
+# Robot settings
+# --------------------------------------------------
 
 ROBOT_PORT = "/dev/ttyACM0"
 ROBOT_ID = "dbot"
 
+
+# --------------------------------------------------
+# Motion settings
+# --------------------------------------------------
+
+# Step size for normal arm joints, in degrees
 STEP_DEG = 2.0
+
+# Separate step size for gripper.
+# The gripper usually needs a larger step than revolute joints.
+GRIPPER_STEP = 5.0
+
+# Delay after each command
 COMMAND_DELAY = 0.03
 
+
+# --------------------------------------------------
+# Joint names
+# --------------------------------------------------
 
 joint_names = [
     "shoulder_pan.pos",
@@ -39,14 +63,27 @@ joint_labels = [
     "gripper",
 ]
 
+
+# --------------------------------------------------
+# Joint limits
+# --------------------------------------------------
+
 joint_limits = {
-    "shoulder_pan.pos": (-90.0, 90.0),
+    "shoulder_pan.pos": (-120.0, 120.0),
     "shoulder_lift.pos": (-105.0, 90.0),
     "elbow_flex.pos": (-90.0, 95.0),
     "wrist_flex.pos": (-90.0, 90.0),
-    "wrist_roll.pos": (-90.0, 90.0),
-    "gripper.pos": (0.0, 0.0),
+    "wrist_roll.pos": (-180.0, 180.0),
+
+    # Gripper range.
+    # If 0 to 100 does not fully open/close, adjust this range.
+    "gripper.pos": (0.0, 100.0),
 }
+
+
+# --------------------------------------------------
+# Named poses
+# --------------------------------------------------
 
 home = {
     "shoulder_pan.pos": 0.0,
@@ -54,26 +91,38 @@ home = {
     "elbow_flex.pos": 0.0,
     "wrist_flex.pos": 0.0,
     "wrist_roll.pos": 0.0,
-    "gripper.pos": 0.0,
+    "gripper.pos": 50.0,
 }
 
 rest = {
     "shoulder_pan.pos": 0.0,
     "shoulder_lift.pos": -105.0,
     "elbow_flex.pos": 95.0,
-    "wrist_flex.pos": -90.0,
+    "wrist_flex.pos": 0.0,
     "wrist_roll.pos": 0.0,
     "gripper.pos": 0.0,
 }
 
+
+# Start software state at rest pose
 current_action = dict(rest)
 
 
 def clamp(value, min_value, max_value):
+    """
+    Clamp value between min_value and max_value.
+    """
+
     return max(min_value, min(max_value, value))
 
 
 def save_current_pose(action):
+    """
+    Save latest commanded pose to JSON.
+    This is useful because the SO-ARM follower does not always provide
+    reliable live feedback for every script.
+    """
+
     POSE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     with open(POSE_FILE, "w") as f:
@@ -81,29 +130,46 @@ def save_current_pose(action):
 
 
 def load_current_pose_if_available():
+    """
+    Load previous commanded pose if it exists.
+    This helps the script continue from the last saved command.
+    """
+
     global current_action
 
     if POSE_FILE.exists():
         with open(POSE_FILE, "r") as f:
-            current_action = json.load(f)
+            loaded_action = json.load(f)
+
+        # Only load keys that exist in joint_names
+        for name in joint_names:
+            if name in loaded_action:
+                current_action[name] = float(loaded_action[name])
 
 
 def send_and_save_pose(robot, action):
-    action["gripper.pos"] = 0.0
+    """
+    Send command to robot and save it locally.
+    """
+
     robot.send_action(action)
     save_current_pose(action)
 
 
 def move_smooth(robot, target_action):
+    """
+    Smoothly move from current_action to target_action.
+    This avoids sudden jumps.
+    """
+
     global current_action
 
     final_action = dict(current_action)
 
+    # Fill target values
     for name in joint_names:
         if name in target_action:
             final_action[name] = float(target_action[name])
-
-    final_action["gripper.pos"] = 0.0
 
     current = np.array(
         [current_action[name] for name in joint_names],
@@ -132,25 +198,27 @@ def move_smooth(robot, target_action):
             for idx, name in enumerate(joint_names)
         }
 
-        action["gripper.pos"] = 0.0
         send_and_save_pose(robot, action)
         time.sleep(COMMAND_DELAY)
 
     current_action = final_action
-    current_action["gripper.pos"] = 0.0
     save_current_pose(current_action)
 
 
 def draw_screen(stdscr, active_joint_idx):
+    """
+    Draw terminal interface.
+    """
+
     stdscr.clear()
 
-    stdscr.addstr(0, 0, "SO-101 Keyboard Joint Control")
-    stdscr.addstr(1, 0, "-----------------------------")
+    stdscr.addstr(0, 0, "SO-101 Keyboard Joint + Gripper Control")
+    stdscr.addstr(1, 0, "---------------------------------------")
 
     stdscr.addstr(3, 0, "Controls:")
-    stdscr.addstr(4, 2, "TAB         : switch joint")
-    stdscr.addstr(5, 2, "LEFT arrow  : move selected joint negative")
-    stdscr.addstr(6, 2, "RIGHT arrow : move selected joint positive")
+    stdscr.addstr(4, 2, "TAB         : switch selected joint, including gripper")
+    stdscr.addstr(5, 2, "LEFT arrow  : decrease selected joint/gripper")
+    stdscr.addstr(6, 2, "RIGHT arrow : increase selected joint/gripper")
     stdscr.addstr(7, 2, "h           : move home")
     stdscr.addstr(8, 2, "r           : move rest")
     stdscr.addstr(9, 2, "q           : quit")
@@ -165,16 +233,25 @@ def draw_screen(stdscr, active_joint_idx):
         value = current_action[name]
         min_lim, max_lim = joint_limits[name]
 
+        if name == "gripper.pos":
+            unit = "%"
+        else:
+            unit = "deg"
+
         stdscr.addstr(
             15 + i,
             0,
-            f"{marker} {label:15s}: {value:8.2f} deg   limits [{min_lim:.1f}, {max_lim:.1f}]"
+            f"{marker} {label:15s}: {value:8.2f} {unit:3s}   limits [{min_lim:.1f}, {max_lim:.1f}]"
         )
 
     stdscr.refresh()
 
 
 def keyboard_control(stdscr, robot):
+    """
+    Main keyboard loop.
+    """
+
     global current_action
 
     curses.curs_set(0)
@@ -183,6 +260,7 @@ def keyboard_control(stdscr, robot):
 
     active_joint_idx = 0
 
+    # Load last saved pose
     load_current_pose_if_available()
     save_current_pose(current_action)
 
@@ -205,10 +283,9 @@ def keyboard_control(stdscr, robot):
             move_smooth(robot, rest)
 
         elif key == 9:
+            # TAB switches through ALL joints, including gripper.
+            # This fixes the issue where gripper was skipped.
             active_joint_idx = (active_joint_idx + 1) % len(joint_names)
-
-            if joint_names[active_joint_idx] == "gripper.pos":
-                active_joint_idx = (active_joint_idx + 1) % len(joint_names)
 
         elif key in [curses.KEY_LEFT, curses.KEY_RIGHT]:
             joint = joint_names[active_joint_idx]
@@ -216,13 +293,18 @@ def keyboard_control(stdscr, robot):
 
             min_lim, max_lim = joint_limits[joint]
 
+            # Use larger step for gripper
+            if joint == "gripper.pos":
+                step = GRIPPER_STEP
+            else:
+                step = STEP_DEG
+
             current_action[joint] = clamp(
-                current_action[joint] + direction * STEP_DEG,
+                current_action[joint] + direction * step,
                 min_lim,
                 max_lim,
             )
 
-            current_action["gripper.pos"] = 0.0
             send_and_save_pose(robot, dict(current_action))
             time.sleep(COMMAND_DELAY)
 

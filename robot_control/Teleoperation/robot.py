@@ -114,20 +114,20 @@ JOINT_OFFSETS_DEG = np.array([
 
 # Robot command limits in degrees
 theta_min_robot_deg = np.array([
-    -105.0,
+    -120.0,
     -95.0,
     -90.0,
     -90.0,
-    -90.0,
+    -180.0,
     0.0
 ])
 
 theta_max_robot_deg = np.array([
-    105.0,
+    120.0,
     105.0,
     95.0,
     90.0,
-    90.0,
+    180.0,
     100.0
 ])
 
