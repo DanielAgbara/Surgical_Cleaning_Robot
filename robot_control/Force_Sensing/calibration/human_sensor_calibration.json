@@ -1,0 +1,16 @@
+{
+    "profile_name": "human_sensor",
+    "port": "/dev/ttyACM0",
+    "baud_rate": 9600,
+    "gravity": 9.80665,
+    "offset": -17.750500000000002,
+    "newtons_per_unit": 0.013831030312432784,
+    "known_mass_kg": 0.2,
+    "known_force_n": 1.96133,
+    "zero_mean": -17.750500000000002,
+    "loaded_mean": 124.05600000000003,
+    "zero_std": 0.5080351857893309,
+    "loaded_std": 90.32911636897596,
+    "samples": 200,
+    "timestamp": 1782499273.4321756
+}
