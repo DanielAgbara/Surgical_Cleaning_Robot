@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
+
 """
 force_reader.py
 
 Runtime force sensor reader.
 
-This script uses the reusable ForceSensor class from:
+This script uses calibration JSON files created by calibrate_force_sensor.py.
 
-    robot_control/Force_Sensing/force_sensor.py
+Example calibration files:
 
-Use this script after calibration.
+    calibration/human_sensor_calibration.json
+    calibration/robot_sensor_calibration.json
 
-Examples:
+Example usage:
 
-    # Read human QLMH-41 calibrated force
-    python force_reader.py --profile qlmh41_human --port /dev/ttyUSB0
+    python force_reader.py --profile human_sensor --port /dev/ttyACM0
 
-    # Read robot QLMH-25 calibrated force
-    python force_reader.py --profile qlmh25_robot --port /dev/ttyUSB0
+    python force_reader.py --profile robot_sensor --port /dev/ttyACM1
 
-    # Read only raw ADC data
-    python force_reader.py --profile qlmh41_human --port /dev/ttyUSB0 --raw
+    python force_reader.py --profile human_sensor --port /dev/ttyACM0 --raw
+
+Notes:
+    - This assumes Arduino sends raw numeric sensor values.
+    - Python loads offset and newtons_per_unit from the calibration JSON file.
+    - The reader sends a tare command before reading.
 """
 
 import argparse
@@ -30,14 +34,6 @@ from pathlib import Path
 
 # --------------------------------------------------
 # Path setup
-# --------------------------------------------------
-# This lets this file import force_sensor.py from the same folder.
-# Folder:
-#   Surgical_Cleaning_Robot/robot_control/Force_Sensing/
-# Files:
-#   force_sensor.py
-#   force_reader.py
-#   force_sensor_calibrate.py
 # --------------------------------------------------
 
 THIS_FILE = Path(__file__).resolve()
@@ -50,7 +46,7 @@ sys.path.insert(0, str(FORCE_SENSING_DIR))
 # Import reusable force sensor class
 # --------------------------------------------------
 
-from force_sensor import ForceSensor, SENSOR_PROFILES
+from force_sensor import ForceSensor
 
 
 def build_arg_parser():
@@ -64,26 +60,27 @@ def build_arg_parser():
 
     parser.add_argument(
         "--profile",
-        choices=list(SENSOR_PROFILES.keys()),
+        type=str,
         required=True,
         help=(
-            "Sensor profile to use. "
-            "Use qlmh41_human for human sensor. "
-            "Use qlmh25_robot for robot sensor."
+            "Calibration profile name. "
+            "Example: human_sensor or robot_sensor. "
+            "This loads calibration/<profile>_calibration.json"
         ),
     )
 
     parser.add_argument(
         "--port",
-        default="/dev/ttyUSB0",
-        help="Arduino serial port. Default: /dev/ttyUSB0",
+        type=str,
+        default="/dev/ttyACM0",
+        help="Arduino serial port. Default: /dev/ttyACM0",
     )
 
     parser.add_argument(
         "--baud",
         type=int,
-        default=115200,
-        help="Arduino baud rate. Default: 115200",
+        default=9600,
+        help="Arduino baud rate. Default: 9600",
     )
 
     parser.add_argument(
@@ -96,7 +93,7 @@ def build_arg_parser():
     parser.add_argument(
         "--raw",
         action="store_true",
-        help="Read raw ADC data only instead of calibrated force.",
+        help="Print raw sensor readings only.",
     )
 
     parser.add_argument(
@@ -105,6 +102,19 @@ def build_arg_parser():
         choices=[-1.0, 1.0],
         default=1.0,
         help="Use -1 if force direction is reversed. Default: 1.",
+    )
+
+    parser.add_argument(
+        "--calibration-dir",
+        type=str,
+        default="calibration",
+        help="Folder containing calibration JSON files.",
+    )
+
+    parser.add_argument(
+        "--no-tare",
+        action="store_true",
+        help="Do not send tare command before reading.",
     )
 
     return parser
@@ -117,14 +127,16 @@ def main():
 
     args = build_arg_parser().parse_args()
 
-    sensor = ForceSensor(
-        profile_name=args.profile,
-        port=args.port,
-        baud=args.baud,
-        force_sign=args.force_sign,
-    )
-
     dt = 1.0 / args.hz
+
+    sensor = ForceSensor(
+        port=args.port,
+        baud_rate=args.baud,
+        print_data=False,
+        input_mode="raw_units",
+        profile_name=args.profile,
+        calibration_dir=args.calibration_dir,
+    )
 
     print("")
     print("--------------------------------------------------")
@@ -134,33 +146,62 @@ def main():
     print(f"Port: {args.port}")
     print(f"Baud: {args.baud}")
     print(f"Rate: {args.hz} Hz")
-    print(f"Mode: {'RAW ADC' if args.raw else 'CALIBRATED FORCE'}")
+    print(f"Calibration dir: {args.calibration_dir}")
+    print(f"Mode: {'RAW SENSOR VALUES' if args.raw else 'CALIBRATED FORCE'}")
+    print(f"Force sign: {args.force_sign}")
     print("Press CTRL+C to stop.")
     print("--------------------------------------------------")
     print("")
 
     try:
+        # --------------------------------------------------
+        # Tare before reading
+        # --------------------------------------------------
+
+        if not args.no_tare:
+            input("Remove all load from the sensor, then press ENTER to tare...")
+
+            print("Sending tare command...")
+            sensor.tare()
+
+            # Give Arduino time to apply tare.
+            time.sleep(1.0)
+
+            # Clear old readings after tare.
+            if sensor.serial_connection is not None:
+                sensor.serial_connection.reset_input_buffer()
+
+            print("Tare complete. Starting live readings...")
+            print("")
+
+        # --------------------------------------------------
+        # Live reading loop
+        # --------------------------------------------------
+
         while True:
             if args.raw:
-                data = sensor.read_raw()
+                raw_value = sensor.read_numeric_line()
 
-                if data is not None:
-                    print(
-                        f"Raw ADC: {data['raw_adc']:.0f} | "
-                        f"Arduino Time: {data['arduino_time_ms']:.0f} ms | "
-                        f"PC Time: {data['pc_time_s']:.3f}"
-                    )
+                if raw_value is not None:
+                    print(f"Raw value: {raw_value:.3f}")
 
             else:
-                data = sensor.read_force()
+                data = sensor.read()
 
                 if data is not None:
+                    raw_value = data["raw_value"]
+                    force_n = data["force_n"] * args.force_sign
+                    mass_kg = force_n / sensor.g
+                    weight_g = mass_kg * 1000.0
+
+                    tared_value = raw_value - sensor.offset
+
                     print(
-                        f"Raw: {data['raw_adc']:.0f} | "
-                        f"Tared: {data['tared_adc']:.0f} | "
-                        f"Force: {data['force_N']:.4f} N | "
-                        f"Arduino Time: {data['arduino_time_ms']:.0f} ms | "
-                        f"PC Time: {data['pc_time_s']:.3f}"
+                        f"Raw: {raw_value:.3f} | "
+                        f"Tared: {tared_value:.3f} | "
+                        f"Weight: {weight_g:.2f} g | "
+                        f"Force: {force_n:.4f} N | "
+                        f"Time: {data['timestamp']:.3f}"
                     )
 
             time.sleep(dt)
@@ -170,7 +211,7 @@ def main():
         print("Shutting down...")
 
     finally:
-        sensor.disconnect()
+        sensor.close()
         print("Force sensor disconnected.")
 
 

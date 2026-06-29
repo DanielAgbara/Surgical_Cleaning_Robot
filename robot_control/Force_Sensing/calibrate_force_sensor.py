@@ -3,107 +3,110 @@
 """
 calibrate_force_sensor.py
 
-Interactive calibration script for force_sensor.py.
+Multi-weight force sensor calibration.
 
-This script uses the ForceSensor class, so all serial communication stays
-inside force_sensor.py.
+This uses ForceSensor from force_sensor.py.
 
-Works for:
-    - human force sensor
-    - robot force sensor
+Instead of calibrating from only one known mass, this script collects
+multiple known masses and fits:
 
-Example usage:
+    force_N = slope * raw_value + intercept
+
+This is better because it uses all calibration points together.
+
+Example:
     python calibrate_force_sensor.py --profile human_sensor --port /dev/ttyACM0
-
     python calibrate_force_sensor.py --profile robot_sensor --port /dev/ttyACM1
-
-Assumption:
-    Arduino sends one numeric raw sensor value per line.
-
-Calibration formula:
-    known_mass_kg = known_mass_g / 1000
-    known_force_N = known_mass_kg * 9.80665
-
-    offset = average zero-load reading
-    delta = loaded_mean - offset
-
-    newtons_per_unit = known_force_N / delta
-
-    force_N = (raw_reading - offset) * newtons_per_unit
 """
 
 import argparse
+import json
 import time
+from pathlib import Path
 
 import numpy as np
 
 from force_sensor import ForceSensor
 
 
-def ask_known_mass_g():
-    """
-    Ask user for the known calibration mass in grams.
-
-    Example valid inputs:
-        100
-        200
-        500
-    """
-
-    while True:
-        user_input = input(
-            "Enter known calibration mass in grams, e.g. 100, 200, 500: "
-        ).strip()
-
-        try:
-            mass_g = float(user_input)
-
-            if mass_g <= 0:
-                print("Mass must be greater than zero.")
-                continue
-
-            return mass_g
-
-        except ValueError:
-            print("Invalid input. Please enter a number like 100, 200, or 500.")
-
-
 def ask_yes_no(prompt):
-    """
-    Ask a yes/no question.
-
-    Returns
-    -------
-    bool
-        True for yes.
-        False for no.
-    """
-
     while True:
-        user_input = input(prompt).strip().lower()
+        ans = input(prompt).strip().lower()
 
-        if user_input in ["y", "yes"]:
+        if ans in ["y", "yes"]:
             return True
 
-        if user_input in ["n", "no"]:
+        if ans in ["n", "no"]:
             return False
 
         print("Please enter y or n.")
 
 
-def show_calibrated_readings(
-    sensor,
-    offset,
-    newtons_per_unit,
-    num_readings=50,
+def ask_known_mass_g():
+    while True:
+        ans = input(
+            "Enter known mass in grams, e.g. 0, 100, 200, 500: "
+        ).strip()
+
+        try:
+            mass_g = float(ans)
+
+            if mass_g < 0:
+                print("Mass cannot be negative.")
+                continue
+
+            return mass_g
+
+        except ValueError:
+            print("Please enter a valid number.")
+
+
+def save_linear_calibration(
+    calibration_dir,
+    profile_name,
+    port,
+    baud_rate,
+    gravity,
+    slope,
+    intercept,
+    calibration_points,
+    samples,
 ):
     """
-    Show converted readings after calibration.
+    Save linear calibration JSON.
 
-    This lets you check if the calibration looks reasonable.
+    Formula:
+        force_N = slope * raw_value + intercept
+    """
 
-    If you keep a 200 g mass on the sensor, the displayed weight should be
-    close to 200 g.
+    calibration_dir = Path(calibration_dir)
+    calibration_dir.mkdir(parents=True, exist_ok=True)
+
+    calibration_file = calibration_dir / f"{profile_name}_calibration.json"
+
+    data = {
+        "profile_name": profile_name,
+        "calibration_type": "linear_regression",
+        "port": port,
+        "baud_rate": baud_rate,
+        "gravity": gravity,
+        "slope": float(slope),
+        "intercept": float(intercept),
+        "formula": "force_N = slope * raw_value + intercept",
+        "samples_per_mass": samples,
+        "calibration_points": calibration_points,
+        "timestamp": time.time(),
+    }
+
+    with open(calibration_file, "w") as f:
+        json.dump(data, f, indent=4)
+
+    print(f"Saved calibration to: {calibration_file}")
+
+
+def show_calibrated_readings(sensor, slope, intercept, num_readings=50):
+    """
+    Show live readings using the fitted line.
     """
 
     print("")
@@ -111,7 +114,7 @@ def show_calibrated_readings(
     print(f"SHOWING {num_readings} CALIBRATED READINGS")
     print("--------------------------------------------------")
     print("Using:")
-    print("    force_N = (raw_reading - offset) * newtons_per_unit")
+    print("    force_N = slope * raw_value + intercept")
     print("")
 
     count = 0
@@ -123,7 +126,7 @@ def show_calibrated_readings(
             time.sleep(0.005)
             continue
 
-        force_n = (raw_value - offset) * newtons_per_unit
+        force_n = slope * raw_value + intercept
         mass_kg = force_n / sensor.g
         weight_g = mass_kg * 1000.0
 
@@ -149,190 +152,183 @@ def run_calibration(
     calibration_dir,
     check_readings,
 ):
-    """
-    Run interactive force sensor calibration.
-
-    Steps:
-        1. Connect to force sensor.
-        2. Ask user to remove load.
-        3. Send Arduino tare command.
-        4. Collect zero-load readings.
-        5. Ask user for known mass in grams.
-        6. Collect loaded readings.
-        7. Compute calibration scale.
-        8. Save calibration JSON.
-        9. Show calibrated readings for validation.
-        10. Ask if user wants to try another known mass.
-    """
-
     sensor = ForceSensor(
         port=port,
         baud_rate=baud_rate,
         print_data=False,
-
-        # During calibration, we want the raw numeric values.
         input_mode="raw_units",
-
-        # Do not load a profile because we are creating/updating one.
         profile_name=None,
-
         calibration_dir=calibration_dir,
     )
+
+    calibration_points = []
 
     try:
         print("")
         print("--------------------------------------------------")
         print("FORCE SENSOR CALIBRATION")
         print("--------------------------------------------------")
-        print(f"Profile name: {profile_name}")
+        print(f"Profile: {profile_name}")
         print(f"Port: {port}")
-        print(f"Baud rate: {baud_rate}")
-        print(f"Samples per step: {samples}")
+        print(f"Baud: {baud_rate}")
+        print(f"Samples per mass: {samples}")
         print("--------------------------------------------------")
         print("")
 
-        # --------------------------------------------------
-        # Step 1: Tare / zero the sensor first
-        # --------------------------------------------------
-
         input("Remove all load from the sensor, then press ENTER to tare...")
 
-        print("Sending tare command to Arduino...")
         sensor.tare()
-
-        # Give Arduino time to apply its internal tare.
         time.sleep(1.0)
 
-        # Clear any old readings or Arduino messages after tare.
         if sensor.serial_connection is not None:
             sensor.serial_connection.reset_input_buffer()
 
-        print("Tare command complete.")
-        print("Collecting zero-load readings...")
+        print("Tare complete.")
+        print("")
+
+        print("First, collect the zero-load point.")
+        input("Make sure there is 0 g on the sensor, then press ENTER...")
 
         zero_samples = sensor.collect_raw_samples(num_samples=samples)
+        zero_raw_mean = float(np.mean(zero_samples))
+        zero_raw_std = float(np.std(zero_samples))
 
-        offset = float(np.mean(zero_samples))
-        zero_std = float(np.std(zero_samples))
+        calibration_points.append(
+            {
+                "mass_g": 0.0,
+                "force_N": 0.0,
+                "raw_mean": zero_raw_mean,
+                "raw_std": zero_raw_std,
+            }
+        )
 
         print("")
-        print("Zero measurement after tare:")
-        print(f"Offset mean: {offset:.6f}")
-        print(f"Offset std:  {zero_std:.6f}")
+        print("Zero point collected:")
+        print(f"Raw mean: {zero_raw_mean:.6f}")
+        print(f"Raw std:  {zero_raw_std:.6f}")
         print("")
-
-        # --------------------------------------------------
-        # Step 2: Calibration loop
-        # --------------------------------------------------
 
         while True:
-            known_mass_g = ask_known_mass_g()
-            known_mass_kg = known_mass_g / 1000.0
+            mass_g = ask_known_mass_g()
 
-            input(
-                f"Place {known_mass_g:.1f} g on the sensor, then press ENTER..."
-            )
-
-            # Clear transition readings while the user is placing the weight.
-            if sensor.serial_connection is not None:
-                sensor.serial_connection.reset_input_buffer()
-
-            loaded_samples = sensor.collect_raw_samples(num_samples=samples)
-
-            loaded_mean = float(np.mean(loaded_samples))
-            loaded_std = float(np.std(loaded_samples))
-
-            known_force_n = known_mass_kg * sensor.g
-            delta = loaded_mean - offset
-
-            if abs(delta) < 1e-9:
-                print("")
-                print("Calibration failed.")
-                print("Loaded reading is too close to zero reading.")
-                print("Try again with a heavier known mass.")
-                print("")
+            if mass_g == 0:
+                print("Zero point already collected. Use a nonzero mass.")
                 continue
 
-            newtons_per_unit = known_force_n / delta
+            mass_kg = mass_g / 1000.0
+            force_n = mass_kg * sensor.g
 
-            # Save calibration profile.
-            sensor.save_calibration(
-                profile_name=profile_name,
-                offset=offset,
-                newtons_per_unit=newtons_per_unit,
-                known_mass_kg=known_mass_kg,
-                known_force_n=known_force_n,
-                zero_mean=offset,
-                loaded_mean=loaded_mean,
-                zero_std=zero_std,
-                loaded_std=loaded_std,
-                samples=samples,
-            )
-
-            print("")
-            print("--------------------------------------------------")
-            print("CALIBRATION COMPLETE")
-            print("--------------------------------------------------")
-            print(f"Known mass:       {known_mass_g:.2f} g")
-            print(f"Known force:      {known_force_n:.6f} N")
-            print(f"Zero offset:      {offset:.6f}")
-            print(f"Loaded mean:      {loaded_mean:.6f}")
-            print(f"Loaded std:       {loaded_std:.6f}")
-            print(f"Delta reading:    {delta:.6f}")
-            print(f"Newtons per unit: {newtons_per_unit:.9f}")
-            print("")
-            print("Formula:")
-            print("    force_N = (raw_reading - offset) * newtons_per_unit")
-            print("--------------------------------------------------")
-            print("")
-
-            # --------------------------------------------------
-            # Step 3: Show calibrated readings for validation
-            # --------------------------------------------------
-
-            if check_readings > 0:
-                input(
-                    f"Keep the {known_mass_g:.1f} g mass on the sensor and "
-                    f"press ENTER to show {check_readings} calibrated readings..."
-                )
-
-                show_calibrated_readings(
-                    sensor=sensor,
-                    offset=offset,
-                    newtons_per_unit=newtons_per_unit,
-                    num_readings=check_readings,
-                )
-
-            # --------------------------------------------------
-            # Step 4: Ask if user wants another known weight
-            # --------------------------------------------------
-
-            repeat = ask_yes_no(
-                "Do you want to calibrate/test another known weight? [y/n]: "
-            )
-
-            if not repeat:
-                print("Calibration finished.")
-                break
-
-            print("")
-            input(
-                "Remove the weight from the sensor, then press ENTER "
-                "to continue using the same zero offset..."
-            )
+            input(f"Place {mass_g:.1f} g on the sensor, then press ENTER...")
 
             if sensor.serial_connection is not None:
                 sensor.serial_connection.reset_input_buffer()
+
+            raw_samples = sensor.collect_raw_samples(num_samples=samples)
+            raw_mean = float(np.mean(raw_samples))
+            raw_std = float(np.std(raw_samples))
+
+            calibration_points.append(
+                {
+                    "mass_g": float(mass_g),
+                    "force_N": float(force_n),
+                    "raw_mean": raw_mean,
+                    "raw_std": raw_std,
+                }
+            )
+
+            print("")
+            print("Point collected:")
+            print(f"Mass:      {mass_g:.2f} g")
+            print(f"Force:     {force_n:.6f} N")
+            print(f"Raw mean:  {raw_mean:.6f}")
+            print(f"Raw std:   {raw_std:.6f}")
+            print("")
+
+            if len(calibration_points) >= 3:
+                done = ask_yes_no(
+                    "Do you want to finish and fit calibration now? [y/n]: "
+                )
+
+                if done:
+                    break
+            else:
+                print("Collect at least 2 nonzero masses if possible.")
+                print("Example: 100 g, 200 g, 500 g.")
+                print("")
+
+        raw_values = np.array(
+            [p["raw_mean"] for p in calibration_points],
+            dtype=float,
+        )
+
+        force_values = np.array(
+            [p["force_N"] for p in calibration_points],
+            dtype=float,
+        )
+
+        # Fit force_N = slope * raw_value + intercept
+        slope = np.sum(raw_values * force_values) / np.sum(raw_values ** 2)
+        intercept = 0.0
+
+        predicted_force = slope * raw_values + intercept
+        residuals = force_values - predicted_force
+        rmse = float(np.sqrt(np.mean(residuals ** 2)))
+
+        save_linear_calibration(
+            calibration_dir=calibration_dir,
+            profile_name=profile_name,
+            port=port,
+            baud_rate=baud_rate,
+            gravity=sensor.g,
+            slope=slope,
+            intercept=intercept,
+            calibration_points=calibration_points,
+            samples=samples,
+        )
+
+        print("")
+        print("--------------------------------------------------")
+        print("LINEAR CALIBRATION COMPLETE")
+        print("--------------------------------------------------")
+        print("Formula:")
+        print("    force_N = slope * raw_value + intercept")
+        print("")
+        print(f"Slope:     {slope:.12f}")
+        print(f"Intercept: {intercept:.12f}")
+        print(f"RMSE:      {rmse:.6f} N")
+        print("--------------------------------------------------")
+        print("")
+
+        print("Calibration points:")
+        for p, pred, err in zip(calibration_points, predicted_force, residuals):
+            print(
+                f"Mass: {p['mass_g']:8.2f} g | "
+                f"Raw mean: {p['raw_mean']:12.3f} | "
+                f"Actual: {p['force_N']:9.5f} N | "
+                f"Predicted: {pred:9.5f} N | "
+                f"Error: {err:9.5f} N"
+            )
+
+        print("")
+
+        if check_readings > 0:
+            input(
+                "Keep any known mass on the sensor and press ENTER "
+                f"to show {check_readings} calibrated readings..."
+            )
+
+            show_calibrated_readings(
+                sensor=sensor,
+                slope=slope,
+                intercept=intercept,
+                num_readings=check_readings,
+            )
 
     finally:
         sensor.close()
 
 
 def main():
-    """
-    Parse command-line arguments and start calibration.
-    """
-
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
@@ -360,7 +356,7 @@ def main():
         "--samples",
         type=int,
         default=200,
-        help="Number of samples to average at each calibration step.",
+        help="Number of samples to average for each known mass.",
     )
 
     parser.add_argument(

@@ -10,20 +10,20 @@ This version does NOT use Haplink.
 It assumes the Arduino sends one numeric value per line over serial.
 
 The Arduino value can be either:
-    1. raw ADC / HX711 counts
+    1. raw ADC / raw load cell units
     2. already-calibrated grams
 
-This class supports both.
+Supported calibration formats:
 
-Recommended project structure:
+1. Old two-point calibration:
+       force_N = (raw_value - offset) * newtons_per_unit
 
-Force_Sensing/
-│
-├── force_sensor.py
-├── calibrate_force_sensor.py
-└── calibration/
-    ├── human_sensor_calibration.json
-    └── robot_sensor_calibration.json
+2. New linear-regression calibration:
+       force_N = slope * raw_value + intercept
+
+Important:
+    If no calibration file exists, this script will still run.
+    In that case, raw values are returned and force_N will be None.
 """
 
 import serial
@@ -46,40 +46,6 @@ class ForceSensor:
     ):
         """
         Initialize force sensor.
-
-        Parameters
-        ----------
-        port : str
-            Serial port.
-            Linux example: "/dev/ttyACM0"
-            Windows example: "COM5"
-
-        baud_rate : int
-            Must match Arduino Serial.begin().
-
-        timeout : float
-            Serial timeout in seconds.
-
-        gravity : float
-            Gravity used for force conversion.
-
-        print_data : bool
-            Print readings if True.
-
-        profile_name : str or None
-            Calibration profile to load.
-            Example: "human_sensor" or "robot_sensor"
-
-        calibration_dir : str
-            Folder where calibration JSON files are stored.
-
-        input_mode : str
-            "calibrated_grams":
-                Arduino already sends grams.
-
-            "raw_units":
-                Arduino sends raw ADC/count values.
-                Python uses calibration profile to convert to Newtons.
         """
 
         self.port = port
@@ -91,24 +57,52 @@ class ForceSensor:
 
         self.serial_connection = None
 
-        # Calibration data
+        # Calibration profile information
         self.profile_name = profile_name
         self.calibration_dir = Path(calibration_dir)
 
+        # Calibration type:
+        #   None
+        #   "two_point"
+        #   "linear_regression"
+        self.calibration_type = None
+
+        # Old two-point calibration variables
         self.offset = 0.0
         self.newtons_per_unit = None
 
-        # Latest values
+        # New linear calibration variables
+        self.slope = None
+        self.intercept = None
+
+        # Latest sensor values
         self.latest_raw_value = None
         self.latest_weight_g = None
         self.latest_mass_kg = None
         self.latest_force_n = None
         self.latest_time = None
 
+        # Connect first.
         self.connect()
 
+        # Try to load calibration, but do not crash if it does not exist.
         if self.profile_name is not None:
-            self.load_calibration(self.profile_name)
+            try:
+                self.load_calibration(self.profile_name)
+
+            except FileNotFoundError:
+                print("")
+                print("--------------------------------------------------")
+                print("WARNING")
+                print("--------------------------------------------------")
+                print(f"No calibration file found for profile: {self.profile_name}")
+                print("Sensor will run without calibration.")
+                print("Raw values will still be available.")
+                print("Run calibrate_force_sensor.py to create calibration.")
+                print("--------------------------------------------------")
+                print("")
+
+                self.calibration_type = None
 
     def connect(self):
         """
@@ -196,7 +190,6 @@ class ForceSensor:
         Returns
         -------
         float or None
-            Returns None if no valid numeric line is available.
         """
 
         if self.serial_connection is None:
@@ -217,8 +210,8 @@ class ForceSensor:
                 return None
 
             try:
-                value = float(line)
-                return value
+                return float(line)
+
             except ValueError:
                 # Ignore Arduino messages like:
                 # "Tare complete"
@@ -237,15 +230,11 @@ class ForceSensor:
         -------
         dict or None
 
-        If valid data is available, returns:
+        If calibrated:
+            force_n, mass_kg, and weight_g are calculated.
 
-        {
-            "raw_value": ...,
-            "weight_g": ...,
-            "mass_kg": ...,
-            "force_n": ...,
-            "timestamp": ...
-        }
+        If not calibrated:
+            raw_value is returned, but force_n, mass_kg, and weight_g are None.
         """
 
         raw_value = self.read_numeric_line()
@@ -258,22 +247,34 @@ class ForceSensor:
         self.latest_raw_value = raw_value
         self.latest_time = timestamp
 
+        weight_g = None
+        mass_kg = None
+        force_n = None
+
         if self.input_mode == "calibrated_grams":
-            # Arduino is already sending grams.
+            # Arduino already sends grams.
             weight_g = raw_value
             mass_kg = weight_g / 1000.0
             force_n = mass_kg * self.g
 
         elif self.input_mode == "raw_units":
             # Arduino sends raw sensor units.
-            # Python calibration converts raw units to Newtons.
-            if self.newtons_per_unit is None:
-                print("No calibration loaded. Cannot convert raw units to force.")
-                return None
+            # Python converts raw units to force if calibration is loaded.
 
-            force_n = (raw_value - self.offset) * self.newtons_per_unit
-            mass_kg = force_n / self.g
-            weight_g = mass_kg * 1000.0
+            if self.calibration_type == "linear_regression":
+                force_n = self.slope * raw_value + self.intercept
+                mass_kg = force_n / self.g
+                weight_g = mass_kg * 1000.0
+
+            elif self.calibration_type == "two_point":
+                force_n = (raw_value - self.offset) * self.newtons_per_unit
+                mass_kg = force_n / self.g
+                weight_g = mass_kg * 1000.0
+
+            else:
+                # No calibration loaded.
+                # Keep force/mass/weight as None.
+                pass
 
         else:
             raise ValueError(
@@ -290,22 +291,24 @@ class ForceSensor:
             "mass_kg": mass_kg,
             "force_n": force_n,
             "timestamp": timestamp,
+            "calibrated": force_n is not None,
         }
 
         if self.print_data:
-            print(
-                f"Raw: {raw_value:.4f} | "
-                f"Weight: {weight_g:.2f} g | "
-                f"Force: {force_n:.4f} N"
-            )
+            if force_n is None:
+                print(f"Raw: {raw_value:.4f}")
+            else:
+                print(
+                    f"Raw: {raw_value:.4f} | "
+                    f"Weight: {weight_g:.2f} g | "
+                    f"Force: {force_n:.4f} N"
+                )
 
         return data
 
     def collect_raw_samples(self, num_samples=200):
         """
         Collect raw numeric samples from Arduino.
-
-        This is used by the calibration script.
         """
 
         samples = []
@@ -338,7 +341,9 @@ class ForceSensor:
         samples,
     ):
         """
-        Save calibration profile as JSON.
+        Save old two-point calibration profile as JSON.
+
+        Kept for backward compatibility.
         """
 
         self.calibration_dir.mkdir(parents=True, exist_ok=True)
@@ -347,6 +352,7 @@ class ForceSensor:
 
         data = {
             "profile_name": profile_name,
+            "calibration_type": "two_point",
             "port": self.port,
             "baud_rate": self.baud_rate,
             "gravity": self.g,
@@ -370,6 +376,12 @@ class ForceSensor:
     def load_calibration(self, profile_name):
         """
         Load calibration profile from JSON.
+
+        Supports:
+            force_N = (raw_value - offset) * newtons_per_unit
+
+        and:
+            force_N = slope * raw_value + intercept
         """
 
         calibration_file = self.calibration_dir / f"{profile_name}_calibration.json"
@@ -383,12 +395,44 @@ class ForceSensor:
             data = json.load(f)
 
         self.profile_name = profile_name
-        self.offset = float(data["offset"])
-        self.newtons_per_unit = float(data["newtons_per_unit"])
+        calibration_type = data.get("calibration_type", "two_point")
 
-        print(f"Loaded calibration profile: {profile_name}")
-        print(f"Offset: {self.offset:.6f}")
-        print(f"Newtons/unit: {self.newtons_per_unit:.9f}")
+        if calibration_type == "linear_regression":
+            self.calibration_type = "linear_regression"
+
+            self.slope = float(data["slope"])
+            self.intercept = float(data["intercept"])
+
+            self.offset = 0.0
+            self.newtons_per_unit = self.slope
+
+            print(f"Loaded calibration profile: {profile_name}")
+            print("Calibration type: linear regression")
+            print("Formula: force_N = slope * raw_value + intercept")
+            print(f"Slope:     {self.slope:.12f}")
+            print(f"Intercept: {self.intercept:.12f}")
+
+        elif calibration_type == "two_point":
+            self.calibration_type = "two_point"
+
+            self.offset = float(data["offset"])
+            self.newtons_per_unit = float(data["newtons_per_unit"])
+
+            self.slope = self.newtons_per_unit
+            self.intercept = -self.newtons_per_unit * self.offset
+
+            print(f"Loaded calibration profile: {profile_name}")
+            print("Calibration type: two point")
+            print("Formula: force_N = (raw_value - offset) * newtons_per_unit")
+            print(f"Offset:       {self.offset:.6f}")
+            print(f"Newtons/unit: {self.newtons_per_unit:.9f}")
+            print(f"Equivalent slope:     {self.slope:.12f}")
+            print(f"Equivalent intercept: {self.intercept:.12f}")
+
+        else:
+            raise ValueError(
+                f"Unknown calibration_type in {calibration_file}: {calibration_type}"
+            )
 
     def get_latest_force(self):
         """
@@ -418,8 +462,8 @@ if __name__ == "__main__":
     import termios
     import select
 
-    PORT = "/dev/ttyACM0"
-    BAUD_RATE = 9600
+    PORT = "/dev/ttyUSB0"
+    BAUD_RATE = 115200
 
     def get_key_nonblocking():
         """
@@ -437,13 +481,11 @@ if __name__ == "__main__":
         port=PORT,
         baud_rate=BAUD_RATE,
         print_data=True,
+        input_mode="raw_units",
 
-        # Use this if Arduino sends grams.
-        input_mode="calibrated_grams",
-
-        # Use this later if Arduino sends raw values and Python handles calibration.
-        # input_mode="raw_units",
-        profile_name="human_sensor",
+        # If calibration file exists, it loads automatically.
+        # If it does not exist, the script still runs and prints raw values.
+        profile_name="robot_sensor",
     )
 
     print("")
@@ -452,6 +494,7 @@ if __name__ == "__main__":
     print("Press 't' to tare.")
     print("Press 'c' to send Arduino calibration command.")
     print("Press 'q' to quit.")
+    print("If no calibration exists, raw values are shown only.")
     print("--------------------------------------------------")
     print("")
 

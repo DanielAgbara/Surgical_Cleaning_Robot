@@ -1,16 +1,44 @@
 {
     "profile_name": "human_sensor",
-    "port": "/dev/ttyACM0",
+    "calibration_type": "linear_regression",
+    "port": "/dev/ttyACM1",
     "baud_rate": 9600,
     "gravity": 9.80665,
-    "offset": -1.0365,
-    "newtons_per_unit": 0.009964335611044785,
-    "known_mass_kg": 0.1,
-    "known_force_n": 0.980665,
-    "zero_mean": -1.0365,
-    "loaded_mean": 97.38099999999999,
-    "zero_std": 0.5460931697064155,
-    "loaded_std": 0.42899766899133635,
-    "samples": 200,
-    "timestamp": 1782753868.4590223
+    "slope": 0.009750576187905924,
+    "intercept": 0.0,
+    "formula": "force_N = slope * raw_value + intercept",
+    "samples_per_mass": 200,
+    "calibration_points": [
+        {
+            "mass_g": 0.0,
+            "force_N": 0.0,
+            "raw_mean": 0.267,
+            "raw_std": 0.37843229249100824
+        },
+        {
+            "mass_g": 50.0,
+            "force_N": 0.4903325,
+            "raw_mean": 48.44,
+            "raw_std": 0.4898979485566357
+        },
+        {
+            "mass_g": 100.0,
+            "force_N": 0.980665,
+            "raw_mean": 97.7145,
+            "raw_std": 0.7684658417912923
+        },
+        {
+            "mass_g": 200.0,
+            "force_N": 1.96133,
+            "raw_mean": 202.00099999999998,
+            "raw_std": 0.9322547934980003
+        },
+        {
+            "mass_g": 500.0,
+            "force_N": 4.903325,
+            "raw_mean": 503.267,
+            "raw_std": 0.5507367792330562
+        }
+    ],
+    "timestamp": 1782764443.0347404
 }
