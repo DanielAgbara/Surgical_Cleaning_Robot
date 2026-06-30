@@ -15,19 +15,17 @@ from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 # Paths
 # --------------------------------------------------
 
-ROOT = Path("/home/agbara-admin/Documents/Cleaning_Robot")
-POSE_FILE = ROOT / "data" / "current_robot_pose.json"
+ROOT = Path(__file__).resolve().parent
+UTIL_PATH = ROOT / "Util"
 
-ROBOT_CONTROL_PATH = ROOT / "robot_control"
-IK_PATH = ROBOT_CONTROL_PATH / "IK"
-UTIL_PATH = ROBOT_CONTROL_PATH / "Util"
-
-sys.path.insert(0, str(IK_PATH))
 sys.path.insert(0, str(UTIL_PATH))
 
 from fk import body_product_of_exponentials
 from se3 import screw_axis_from_w_q, adjoint
 
+
+POSE_FILE = ROOT / "data" / "current_robot_pose.json"
+EE_POSE_FILE = ROOT / "data" / "end_effector_pose.txt"
 
 # --------------------------------------------------
 # Robot settings
@@ -284,7 +282,11 @@ def get_theta_rad(action):
 
 def print_end_effector_pose(action):
     """
-    Compute and print the current end-effector pose using FK.
+    Compute the current end-effector pose using FK.
+
+    The pose is:
+        • Printed to the terminal.
+        • Saved to data/end_effector_pose.txt.
     """
 
     theta = get_theta_rad(action)
@@ -298,31 +300,75 @@ def print_end_effector_pose(action):
     p = T_ee[:3, 3]
     R = T_ee[:3, :3]
 
-    print("\n" + "-" * 60)
-    print("CURRENT END-EFFECTOR POSE")
-    print("-" * 60)
+    theta_deg = np.rad2deg(theta)
 
-    print("Robot command angles [deg]:")
+    # --------------------------------------------------
+    # Print to terminal
+    # --------------------------------------------------
+
+    print("\n" + "=" * 70)
+    print("CURRENT END-EFFECTOR POSE")
+    print("=" * 70)
+
+    print("\nRobot command angles [deg]")
+
     for name in joint_names:
         print(f"{name:20s}: {action[name]:8.3f}")
 
-    print("\nIK/FK angles [deg], offset corrected:")
-    theta_deg = np.rad2deg(theta)
-    for i, angle in enumerate(theta_deg):
-        print(f"theta{i + 1:<15d}: {angle:8.3f}")
+    print("\nIK/FK angles [deg]")
 
-    print("\nPosition [m]:")
+    for i, angle in enumerate(theta_deg):
+        print(f"theta{i+1}: {angle:8.3f}")
+
+    print("\nPosition [m]")
     print(f"x = {p[0]:.6f}")
     print(f"y = {p[1]:.6f}")
     print(f"z = {p[2]:.6f}")
 
-    print("\nRotation matrix:")
+    print("\nRotation Matrix")
     print(R)
 
-    print("\nHomogeneous transform T_ee:")
+    print("\nHomogeneous Transform")
     print(T_ee)
 
-    print("-" * 60 + "\n")
+    print("=" * 70)
+
+    # --------------------------------------------------
+    # Save to text file
+    # --------------------------------------------------
+
+    EE_POSE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(EE_POSE_FILE, "w") as f:
+
+        f.write("=" * 70 + "\n")
+        f.write("CURRENT END-EFFECTOR POSE\n")
+        f.write("=" * 70 + "\n\n")
+
+        f.write("Robot command angles [deg]\n")
+
+        for name in joint_names:
+            f.write(f"{name:20s}: {action[name]:8.3f}\n")
+
+        f.write("\nIK/FK angles [deg]\n")
+
+        for i, angle in enumerate(theta_deg):
+            f.write(f"theta{i+1}: {angle:8.3f}\n")
+
+        f.write("\nPosition [m]\n")
+        f.write(f"x = {p[0]:.6f}\n")
+        f.write(f"y = {p[1]:.6f}\n")
+        f.write(f"z = {p[2]:.6f}\n")
+
+        f.write("\nRotation Matrix\n")
+        f.write(np.array2string(R, precision=6))
+        f.write("\n\n")
+
+        f.write("Homogeneous Transform\n")
+        f.write(np.array2string(T_ee, precision=6))
+        f.write("\n")
+
+    print(f"\nPose saved to:\n{EE_POSE_FILE}\n")
 
 
 def move_smooth(robot, target_action):
