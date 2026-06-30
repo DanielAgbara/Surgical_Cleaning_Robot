@@ -7,6 +7,7 @@ UTIL_PATH = ROOT / "Util"
 
 from fk import body_product_of_exponentials
 from jacobian import body_jacobian
+from se3 import inv_SE3, log_screw_axis
 
 
 def jacobian_transpose_position(
@@ -163,3 +164,121 @@ def jacobian_transpose_position(
     theta_history = np.asarray(theta_history)
 
     return theta, theta_history
+
+
+
+def jacobian_transpose_pose(
+    M_ee,
+    B_list,
+    theta_init,
+    T_sd,
+    max_iters=100,
+    tol_w=1e-6,
+    tol_v=1e-6,
+    q_min=None,
+    q_max=None,
+    K=None,
+    print_iterations=False,
+):
+    """
+    Numerical inverse kinematics for full pose using
+    the body Jacobian transpose method.
+    """
+
+    theta = np.asarray(theta_init, dtype=float).reshape(-1)
+    n = len(theta)
+
+    if q_min is None:
+        q_min = np.deg2rad(
+            np.array([-105, -95, -90, -90, -90, -90], dtype=float)
+        )
+
+    if q_max is None:
+        q_max = np.deg2rad(
+            np.array([105, 105, 95, 90, 90, 90], dtype=float)
+        )
+
+    q_min = np.asarray(q_min, dtype=float).reshape(-1)
+    q_max = np.asarray(q_max, dtype=float).reshape(-1)
+
+    if K is None:
+        K = np.eye(6)
+
+    K = np.asarray(K, dtype=float).reshape(6, 6)
+
+    theta_history = []
+    norm_w_b_hist = []
+    norm_v_b_hist = []
+
+    for i in range(max_iters + 1):
+
+        # Current end-effector pose in space/base frame
+        T_sb = body_product_of_exponentials(
+            M_ee,
+            B_list,
+            theta
+        )
+
+        # Body-frame pose error
+        # T_bd = inv(T_sb) @ T_sd
+        T_bs = inv_SE3(T_sb)
+        T_bd = T_bs @ T_sd
+
+        # Your se3.py returns:
+        #   T = exp([S] * theta_err)
+        # So the body twist error vector is:
+        #   Vb = S * theta_err
+        S_err, theta_err = log_screw_axis(T_bd)
+        Vb = S_err * theta_err
+
+        w_b = Vb[0:3]
+        v_b = Vb[3:6]
+
+        norm_w = np.linalg.norm(w_b)
+        norm_v = np.linalg.norm(v_b)
+
+        theta_history.append(theta.copy())
+        norm_w_b_hist.append(norm_w)
+        norm_v_b_hist.append(norm_v)
+
+        if print_iterations:
+            theta_deg = np.rad2deg(theta)
+
+            joint_text = ", ".join(
+                [
+                    f"theta{j + 1}={theta_deg[j]:.2f}deg"
+                    for j in range(n)
+                ]
+            )
+
+            print(
+                f"Iteration {i}: "
+                f"({joint_text}), "
+                f"(x,y,z)=({T_sb[0, 3]:.3f}, {T_sb[1, 3]:.3f}, {T_sb[2, 3]:.3f}), "
+                f"||w_b||={norm_w:.3e}, "
+                f"||v_b||={norm_v:.3e}"
+            )
+
+        if norm_w < tol_w and norm_v < tol_v:
+            break
+
+        J_b = body_jacobian(
+            B_list,
+            theta
+        )
+
+        dq = J_b.T @ K @ Vb
+
+        theta = theta + dq
+
+        theta = np.clip(
+            theta,
+            q_min,
+            q_max
+        )
+
+    theta_history = np.asarray(theta_history)
+    norm_w_b_hist = np.asarray(norm_w_b_hist)
+    norm_v_b_hist = np.asarray(norm_v_b_hist)
+
+    return theta, theta_history, norm_w_b_hist, norm_v_b_hist
