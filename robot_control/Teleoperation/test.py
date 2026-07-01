@@ -18,7 +18,7 @@ if __name__ == "__main__":
     arm.move_to_home()
 
     # Desired end-effector position (x, y, z) in meters
-    p_des = np.array([0.1, 0.33, 0.05])  # Example desired position
+    p_des = np.array([0.4, 0, 0.1])  # Example desired position
 
     # Initial guess for joint angles (in degrees)
     theta_init = arm.get_joint_angles_deg()

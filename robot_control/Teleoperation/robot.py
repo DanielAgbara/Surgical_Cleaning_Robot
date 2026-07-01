@@ -119,7 +119,7 @@ theta_min_robot_deg = np.array([
     -90.0,
     -90.0,
     -180.0,
-    0.0
+    10.0
 ])
 
 theta_max_robot_deg = np.array([
@@ -710,96 +710,109 @@ class SOArm101:
             "wrist_roll.pos": float(theta_robot_deg[4]),
             "gripper.pos": float(theta_robot_deg[5]),
         }
-
-
-    def solve_position_jacobian_transpose(
+    
+    def solve_pose(
         self,
-        p_des,
+        T_des,
         theta_init=None,
         max_iters=100,
-        tol_converge=1e-4,
+        tol_w=1e-6,
+        tol_v=1e-6,
         K=None,
-        print_iterations=False
     ):
         """
-        Solve position-only IK using Jacobian transpose.
-
-        Input theta_init is expected in physical robot command degrees.
-
-        Returns
-        -------
-        theta_sol_ik_rad : np.ndarray, shape (6,)
-            Solved IK/model joint angles in radians.
-
-        theta_history : np.ndarray
-            IK joint history in radians.
-        """
-
-        p_des = np.asarray(p_des, dtype=float).reshape(3)
-
-        if theta_init is None:
-            theta_ik_rad = self.get_theta_rad()
-        else:
-            theta_robot_deg = np.asarray(theta_init, dtype=float).flatten()
-            theta_ik_deg = self.robot_deg_to_ik_deg(theta_robot_deg)
-            theta_ik_rad = np.radians(theta_ik_deg)
-
-        if K is None:
-            K = 0.1 * np.eye(3)
-
-        theta_sol_ik_rad, theta_history = jacobian_transpose_position(
-            M_ee=self.M,
-            B_list=self.B_list,
-            theta_init=theta_ik_rad,
-            p_des=p_des,
-            max_iters=max_iters,
-            tol_converge=tol_converge,
-            q_min=self.theta_min,
-            q_max=self.theta_max,
-            K=K,
-            print_iterations=print_iterations
-        )
-
-        return theta_sol_ik_rad, theta_history
-
-
-    def move_to_position_jacobian_transpose(
-        self,
-        p_des,
-        max_iters=100,
-        tol_converge=1e-4,
-        K=None,
-        print_iterations=False,
-        max_step_deg=2.0,
-        step_delay=0.05
-    ):
-        """
-        Solve IK for desired Cartesian position and move robot.
+        Solve IK for a desired end-effector pose.
 
         Parameters
         ----------
-        p_des : array-like, shape (3,)
-            Desired EE position in meters.
+        T_des : np.ndarray, shape (4,4)
+            Desired end-effector pose in the base frame.
+
+        theta_init : array-like, optional
+            Initial guess in physical robot command degrees.
+            If None, the current robot configuration is used.
+
+        max_iters : int
+            Maximum IK iterations.
+
+        tol_w : float
+            Orientation convergence tolerance.
+
+        tol_v : float
+            Position convergence tolerance.
+
+        K : np.ndarray, optional
+            6x6 gain matrix.
+
+        Returns
+        -------
+        theta_sol_robot_deg : np.ndarray
+            Solution in robot command degrees.
+
+        theta_history_robot_deg : np.ndarray
+            Robot command angle history.
+
+        norm_w_hist : np.ndarray
+            Orientation error history.
+
+        norm_v_hist : np.ndarray
+            Position error history.
         """
 
-        theta_sol_ik_rad, theta_history = self.solve_position_jacobian_transpose(
-            p_des=p_des,
+        T_des = np.asarray(T_des, dtype=float).reshape(4, 4)
+
+        # Initial guess
+        if theta_init is None:
+            theta_robot_deg = self.get_joint_angles_deg()
+        else:
+            theta_robot_deg = np.asarray(theta_init, dtype=float).flatten()
+
+        if len(theta_robot_deg) != 6:
+            raise ValueError("theta_init must contain 6 joint values")
+
+        # Robot command -> IK model
+        theta_ik_deg = self.robot_deg_to_ik_deg(theta_robot_deg)
+        theta_ik_rad = np.radians(theta_ik_deg)
+
+        # Solve pose IK
+        (
+            theta_sol_ik_rad,
+            theta_history_ik_rad,
+            norm_w_hist,
+            norm_v_hist,
+        ) = jacobian_transpose_pose(
+            M_ee=self.M,
+            B_list=self.B_list,
+            theta_init=theta_ik_rad,
+            T_sd=T_des,
             max_iters=max_iters,
-            tol_converge=tol_converge,
+            tol_w=tol_w,
+            tol_v=tol_v,
+            q_min=self.theta_min,
+            q_max=self.theta_max,
             K=K,
-            print_iterations=print_iterations
         )
 
-        action = self.theta_to_action(theta_sol_ik_rad)
+        # Final solution back to robot command angles
+        theta_sol_ik_deg = np.degrees(theta_sol_ik_rad)
+        theta_sol_robot_deg = self.ik_deg_to_robot_deg(theta_sol_ik_deg)
 
-        self.moveSO101(
-            action,
-            max_step_deg=max_step_deg,
-            step_delay=step_delay
+        # Convert history back to robot command angles
+        theta_history_robot_deg = []
+
+        for theta in theta_history_ik_rad:
+            theta_deg = np.degrees(theta)
+            theta_robot = self.ik_deg_to_robot_deg(theta_deg)
+            theta_history_robot_deg.append(theta_robot)
+
+        theta_history_robot_deg = np.asarray(theta_history_robot_deg)
+
+        return (
+            theta_sol_robot_deg,
+            theta_history_robot_deg,
+            norm_w_hist,
+            norm_v_hist,
         )
-
-        return theta_sol_ik_rad, theta_history
-
 
     def connect(self, calibrate=False):
         self.robot.connect(calibrate=calibrate)
