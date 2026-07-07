@@ -148,6 +148,18 @@ def AxisAngleToR(w: np.ndarray, theta: float) -> np.ndarray:
     R = np.eye(3) + np.sin(theta) * w_hat + (1 - np.cos(theta)) * (w_hat @ w_hat)
     return R
 
+def RToQuaternion(R, eps=1e-6):
+    R = np.asarray(R, dtype=float)
+
+    q0 = np.sqrt(R[0, 0] + R[1, 1] + R[2, 2] + 1) / 2
+    q1 = np.sign(R[2, 1] - R[1, 2]) * np.sqrt(R[0, 0] - R[1, 1] - R[2, 2] + 1) / 2
+    q2 = np.sign(R[0, 2] - R[2, 0]) * np.sqrt(R[1, 1] - R[2, 2] - R[0, 0] + 1) / 2
+    q3 = np.sign(R[1, 0] - R[0, 1]) * np.sqrt(R[2, 2] - R[0, 0] - R[1, 1] + 1) / 2
+
+    Q = np.array([q0, q1, q2, q3])
+    Q = Q / np.linalg.norm(Q)
+    return Q
+
 
 def skew(w: np.ndarray) -> np.ndarray:
     """

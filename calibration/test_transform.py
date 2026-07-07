@@ -1,29 +1,54 @@
-import cv2
-import numpy as np
-import pyzed.sl as sl
+#!/usr/bin/env python3
+
+import sys
 from pathlib import Path
 
+import numpy as np
 
-ROOT = Path("/home/agbara-admin/Documents/Cleaning_Robot")
+
+# ============================================================
+# Project paths
+# ============================================================
+
+ROOT = Path("/home/agbara-admin/Documents/Surgical_Cleaning_Robot")
+
+TELEOP_PATH = ROOT / "robot_control" / "Teleoperation"
+sys.path.insert(0, str(TELEOP_PATH))
+
+from robot import SOArm101
+
+
+# ============================================================
+# Calibration path
+# ============================================================
+
 T_PATH = ROOT / "data" / "eye_to_hand" / "T_base_to_camera.npy"
 
-clicked_pixel = None
 
-
-def mouse_callback(event, x, y, flags, param):
-    global clicked_pixel
-
-    if event == cv2.EVENT_LBUTTONDOWN:
-        clicked_pixel = (x, y)
-
+# ============================================================
+# Helpers
+# ============================================================
 
 def transform_point(T, p):
-    p_h = np.array([p[0], p[1], p[2], 1.0], dtype=float)
+    """
+    Transform a 3D point using a 4x4 homogeneous transform.
+    """
+
+    p_h = np.array(
+        [p[0], p[1], p[2], 1.0],
+        dtype=float
+    )
+
     p_out = T @ p_h
+
     return p_out[:3]
 
 
 def is_reachable(p_base):
+    """
+    Rough workspace check before IK.
+    """
+
     x, y, z = p_base
 
     r = np.sqrt(x**2 + y**2)
@@ -37,144 +62,102 @@ def is_reachable(p_base):
     if r < 0.05:
         return False
 
-    if r > 0.40:
+    if r > 0.45:
         return False
 
     return True
 
 
-def get_average_camera_point(point_cloud, u, v, window=5):
-    """
-    Average valid ZED 3D points around clicked pixel.
-
-    This is more stable than using one pixel because stereo depth
-    can be noisy or invalid at edges.
-    """
-
-    points = []
-
-    half = window // 2
-
-    for yy in range(v - half, v + half + 1):
-        for xx in range(u - half, u + half + 1):
-            err, point = point_cloud.get_value(xx, yy)
-
-            if err != sl.ERROR_CODE.SUCCESS:
-                continue
-
-            X, Y, Z = point[:3]
-
-            if np.isfinite(X) and np.isfinite(Y) and np.isfinite(Z):
-                points.append([X, Y, Z])
-
-    if len(points) == 0:
-        return None
-
-    return np.mean(np.array(points), axis=0)
-
+# ============================================================
+# Main
+# ============================================================
 
 def main():
-    global clicked_pixel
+    if len(sys.argv) != 4:
+        print("\nUsage:")
+        print("  python camera_point_to_ik.py X Y Z")
+        print("\nExample:")
+        print("  python camera_point_to_ik.py 0.25 0.05 0.60")
+        print("\nUnits are meters in the camera frame.\n")
+        return
+
+    # ------------------------------------------------------------
+    # Input point in camera frame
+    # ------------------------------------------------------------
+
+    p_camera = np.array(
+        [
+            float(sys.argv[1]),
+            float(sys.argv[2]),
+            float(sys.argv[3]),
+        ],
+        dtype=float
+    )
+
+    # ------------------------------------------------------------
+    # Load hand-eye calibration
+    # ------------------------------------------------------------
 
     T_base_to_camera = np.load(T_PATH)
 
     print("\nT_base_to_camera:")
     print(T_base_to_camera)
 
-    zed = sl.Camera()
+    print("\nInput point in camera frame:")
+    print(p_camera)
 
-    init_params = sl.InitParameters()
-    init_params.camera_resolution = sl.RESOLUTION.HD1080
-    init_params.camera_fps = 30
-    init_params.coordinate_units = sl.UNIT.METER
-    init_params.depth_mode = sl.DEPTH_MODE.NEURAL
+    # ------------------------------------------------------------
+    # Transform camera point to robot base frame
+    # ------------------------------------------------------------
 
-    # Must match the coordinate system used during calibration.
-    init_params.coordinate_system = sl.COORDINATE_SYSTEM.IMAGE
+    p_robot = transform_point(
+        T_base_to_camera,
+        p_camera
+    )
 
-    status = zed.open(init_params)
+    print("\nPoint in robot base frame:")
+    print(p_robot)
 
-    if status != sl.ERROR_CODE.SUCCESS:
-        raise RuntimeError(f"ZED open failed: {status}")
+    reachable = is_reachable(p_robot)
 
-    runtime = sl.RuntimeParameters()
+    print("\nRough reachable check:")
+    print(reachable)
 
-    image_zed = sl.Mat()
-    point_cloud = sl.Mat()
+    if not reachable:
+        print("\n[WARN] Point may be outside rough robot workspace.")
+        print("Still trying IK...\n")
 
-    cv2.namedWindow("Click Depth Test")
-    cv2.setMouseCallback("Click Depth Test", mouse_callback)
+    # ------------------------------------------------------------
+    # IK
+    # ------------------------------------------------------------
 
-    last_text = "Click a pixel"
+    robot = SOArm101(
+        port="/dev/ttyACM0",
+        id="dbot"
+    )
 
-    try:
-        while True:
-            if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
-                continue
+    theta_init = robot.get_joint_angles_deg()
 
-            zed.retrieve_image(image_zed, sl.VIEW.LEFT)
+    theta_sol_robot_deg = robot.solve_position(
+        p_des=p_robot,
+        theta_init=theta_init,
+        max_iters=300,
+        tol_converge=2e-3
+    )
 
-            # Use XYZRGBA because it is commonly supported in ZED examples.
-            zed.retrieve_measure(point_cloud, sl.MEASURE.XYZRGBA)
+    print("\nIK solution [robot command degrees]:")
+    print(theta_sol_robot_deg)
 
-            frame = image_zed.get_data()
+    action = robot.theta_to_action(
+        np.radians(
+            robot.robot_deg_to_ik_deg(theta_sol_robot_deg)
+        )
+    )
 
-            if frame.shape[2] == 4:
-                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-            else:
-                frame_bgr = frame.copy()
+    print("\nRobot action dictionary:")
+    print(action)
 
-            if clicked_pixel is not None:
-                u, v = clicked_pixel
-
-                p_camera = get_average_camera_point(
-                    point_cloud,
-                    u,
-                    v,
-                    window=7
-                )
-
-                if p_camera is None:
-                    last_text = "Invalid depth around clicked pixel"
-                    print(last_text)
-
-                else:
-                    p_base = transform_point(T_base_to_camera, p_camera)
-                    reachable = is_reachable(p_base)
-
-                    last_text = (
-                        f"cam=({p_camera[0]:.3f},{p_camera[1]:.3f},{p_camera[2]:.3f}) m | "
-                        f"base=({p_base[0]:.3f},{p_base[1]:.3f},{p_base[2]:.3f}) m | "
-                        f"reachable={reachable}"
-                    )
-
-                    print("\nClicked pixel:", clicked_pixel)
-                    print("p_camera:", p_camera)
-                    print("p_base:", p_base)
-                    print("reachable:", reachable)
-
-                clicked_pixel = None
-
-            cv2.putText(
-                frame_bgr,
-                last_text,
-                (30, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 255, 0),
-                2,
-            )
-
-            cv2.imshow("Click Depth Test", frame_bgr)
-
-            key = cv2.waitKey(1) & 0xFF
-
-            if key == ord("q"):
-                break
-
-    finally:
-        zed.close()
-        cv2.destroyAllWindows()
+    print("\nThis script only computes IK. It does NOT move the robot.")
 
 
 if __name__ == "__main__":

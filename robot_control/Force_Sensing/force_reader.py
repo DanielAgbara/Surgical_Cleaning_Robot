@@ -14,7 +14,7 @@ Example calibration files:
 
 Example usage:
 
-    python force_reader.py --profile human_sensor --port /dev/ttyACM0
+   
 
     python force_reader.py --profile robot_sensor --port /dev/ttyACM1
 

@@ -18,10 +18,19 @@ from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 # ============================================================
 
 ROOT = Path("/home/agbara-admin/Documents/Surgical_Cleaning_Robot")
-IK_PATH = ROOT / "robot_control" / "IK"
-sys.path.append(str(IK_PATH))
+IK_PATH = ROOT / "robot_control" / "Teleoperation"
+sys.path.insert(0, str(IK_PATH))
 
-from robot import M, S_list
+from robot import (
+    M,
+    S_list,
+    JOINT_OFFSETS_DEG,
+    theta_min_robot_deg,
+    theta_max_robot_deg,
+    home as robot_home,
+    rest as robot_rest,
+)
+
 from fk import space_product_of_exponentials
 
 
@@ -29,7 +38,9 @@ from fk import space_product_of_exponentials
 # Files / folders
 # ============================================================
 
-POSE_FILE = ROOT / "data" / "current_robot_pose.json"
+POSE_FILE = ROOT / "data" / "eye_to_hand" / "current_robot_pose.json"
+FK_FILE = ROOT / "data" / "eye_to_hand" /"current_robot_fk.json"
+
 OUTPUT_DIR = ROOT / "data" / "eye_to_hand"
 
 
@@ -43,8 +54,18 @@ ROBOT_ID = "dbot"
 STEP_DEG = 2.0
 COMMAND_DELAY = 0.03
 
-# Joint 6 / gripper is locked during calibration
-GRIPPER_FIXED_DEG = 90.0
+
+# ============================================================
+# ArUco board settings
+# ============================================================
+
+MARKERS_X = 3
+MARKERS_Y = 3
+
+MARKER_LENGTH_M = 0.0615
+MARKER_SEPARATION_M = 0.00372
+
+DICTIONARY_ID = cv2.aruco.DICT_5X5_100
 
 
 # ============================================================
@@ -69,39 +90,16 @@ joint_labels = [
     "gripper",
 ]
 
-
 joint_limits = {
-    "shoulder_pan.pos": (-90.0, 90.0),
-    "shoulder_lift.pos": (-105.0, 90.0),
-    "elbow_flex.pos": (-90.0, 95.0),
-    "wrist_flex.pos": (-90.0, 90.0),
-    "wrist_roll.pos": (-90.0, 90.0),
-
-    # Gripper is fixed at 90 degrees.
-    "gripper.pos": (GRIPPER_FIXED_DEG, GRIPPER_FIXED_DEG),
+    name: (
+        float(theta_min_robot_deg[i]),
+        float(theta_max_robot_deg[i]),
+    )
+    for i, name in enumerate(joint_names)
 }
 
-
-home = {
-    "shoulder_pan.pos": 0.0,
-    "shoulder_lift.pos": 0.0,
-    "elbow_flex.pos": 0.0,
-    "wrist_flex.pos": 0.0,
-    "wrist_roll.pos": 0.0,
-    "gripper.pos": GRIPPER_FIXED_DEG,
-}
-
-
-rest = {
-    "shoulder_pan.pos": 0.0,
-    "shoulder_lift.pos": -105.0,
-    "elbow_flex.pos": 95.0,
-    "wrist_flex.pos": -90.0,
-    "wrist_roll.pos": 0.0,
-    "gripper.pos": GRIPPER_FIXED_DEG,
-}
-
-
+home = dict(robot_home)
+rest = dict(robot_rest)
 current_action = dict(rest)
 
 
@@ -111,9 +109,8 @@ current_action = dict(rest)
 
 def delete_old_calibration_samples():
     """
-    Delete old calibration samples at the beginning of a new run.
-
-    This prevents accidentally mixing old calibration data with new data.
+    Delete old eye-to-hand calibration files before starting
+    a new calibration run.
     """
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -141,19 +138,105 @@ def delete_old_calibration_samples():
 # ============================================================
 
 def clamp(value, min_value, max_value):
+    return max(min_value, min(max_value, value))
+
+
+def action_to_theta_robot_deg(action):
     """
-    Keep a value within [min_value, max_value].
+    Convert action dictionary to physical robot command angles.
     """
 
-    return max(min_value, min(max_value, value))
+    return np.array(
+        [float(action[name]) for name in joint_names],
+        dtype=float,
+    )
+
+
+def robot_deg_to_model_deg(theta_robot_deg):
+    """
+    Convert robot command angles to FK/model angles.
+
+    Important for joint 6:
+        robot command 50 deg = FK/model 0 deg
+
+    Therefore:
+        theta_model_deg = theta_robot_deg - JOINT_OFFSETS_DEG
+    """
+
+    theta_robot_deg = np.asarray(theta_robot_deg, dtype=float).reshape(6)
+
+    return theta_robot_deg - JOINT_OFFSETS_DEG
+
+
+def action_to_T_base_to_ee(action):
+    """
+    Compute forward kinematics from the current robot command.
+
+    This uses the joint offsets from robot.py, especially joint 6.
+    """
+
+    theta_robot_deg = action_to_theta_robot_deg(action)
+    theta_model_deg = robot_deg_to_model_deg(theta_robot_deg)
+    theta_model_rad = np.radians(theta_model_deg)
+
+    T_base_to_ee = space_product_of_exponentials(
+        M,
+        S_list,
+        theta_model_rad,
+    )
+
+    return T_base_to_ee
+
+
+def save_fk_json(action):
+    """
+    Save FK information to JSON.
+
+    This creates a file similar to current_robot_pose.json, but with:
+        - robot command angles
+        - offset-corrected FK/model angles
+        - T_base_to_ee
+        - end-effector position
+    """
+
+    FK_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    theta_robot_deg = action_to_theta_robot_deg(action)
+    theta_model_deg = robot_deg_to_model_deg(theta_robot_deg)
+    T_base_to_ee = action_to_T_base_to_ee(action)
+
+    fk_data = {
+        "robot_command_degrees": {
+            name: float(theta_robot_deg[i])
+            for i, name in enumerate(joint_names)
+        },
+        "model_fk_degrees": {
+            name: float(theta_model_deg[i])
+            for i, name in enumerate(joint_names)
+        },
+        "joint_offsets_degrees": {
+            name: float(JOINT_OFFSETS_DEG[i])
+            for i, name in enumerate(joint_names)
+        },
+        "T_base_to_ee": T_base_to_ee.tolist(),
+        "ee_position_m": {
+            "x": float(T_base_to_ee[0, 3]),
+            "y": float(T_base_to_ee[1, 3]),
+            "z": float(T_base_to_ee[2, 3]),
+        },
+    }
+
+    with open(FK_FILE, "w") as f:
+        json.dump(fk_data, f, indent=4)
 
 
 def save_current_pose(action):
     """
-    Save the current commanded robot joint pose to JSON.
+    Save current robot pose and FK.
 
-    The calibration sample uses this file indirectly so the robot pose
-    and camera pose stay synchronized.
+    Files written:
+        data/current_robot_pose.json
+        data/current_robot_fk.json
     """
 
     POSE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -161,57 +244,61 @@ def save_current_pose(action):
     with open(POSE_FILE, "w") as f:
         json.dump(action, f, indent=4)
 
+    save_fk_json(action)
+
 
 def load_current_pose_if_available():
     """
-    Load previous robot pose if it exists.
-
-    This allows restarting the script without losing the last known pose.
+    Load previous saved pose if it exists.
     """
 
     global current_action
 
     if POSE_FILE.exists():
         with open(POSE_FILE, "r") as f:
-            current_action = json.load(f)
+            loaded = json.load(f)
 
-    current_action["gripper.pos"] = GRIPPER_FIXED_DEG
+        for name in joint_names:
+            if name in loaded:
+                current_action[name] = float(loaded[name])
+
+    for name in joint_names:
+        min_lim, max_lim = joint_limits[name]
+        current_action[name] = clamp(
+            current_action[name],
+            min_lim,
+            max_lim,
+        )
 
 
-# ============================================================
-# Robot FK helpers
-# ============================================================
-
-def action_to_T_base_to_ee(action):
+def print_robot_transform(action):
     """
-    Convert robot joint dictionary into a 4x4 FK transform.
-
-    Input:
-        action:
-            dictionary with joint values in degrees
-
-    Output:
-        T_base_to_ee:
-            transform from robot base frame to end-effector frame
+    Print FK debug info to terminal and save FK JSON.
     """
 
-    theta_deg = np.array(
-        [float(action[name]) for name in joint_names],
-        dtype=float
-    )
+    theta_robot_deg = action_to_theta_robot_deg(action)
+    theta_model_deg = robot_deg_to_model_deg(theta_robot_deg)
+    T_base_to_ee = action_to_T_base_to_ee(action)
 
-    # Force joint 6 to the fixed calibration angle.
-    theta_deg[5] = GRIPPER_FIXED_DEG
+    save_fk_json(action)
 
-    theta_rad = np.radians(theta_deg)
+    print("\n" + "=" * 60)
+    print("CURRENT ROBOT FK DEBUG")
+    print("=" * 60)
 
-    T_base_to_ee = space_product_of_exponentials(
-        M,
-        S_list,
-        theta_rad
-    )
+    print("\nRobot command angles [deg]:")
+    for name, value in zip(joint_names, theta_robot_deg):
+        print(f"  {name:20s}: {value: .3f}")
 
-    return T_base_to_ee
+    print("\nOffset-corrected FK/model angles [deg]:")
+    for name, value in zip(joint_names, theta_model_deg):
+        print(f"  {name:20s}: {value: .3f}")
+
+    print("\nT_base_to_ee:")
+    print(T_base_to_ee)
+
+    print(f"\n[SAVED FK JSON] {FK_FILE}")
+    print("=" * 60 + "\n")
 
 
 # ============================================================
@@ -219,32 +306,18 @@ def action_to_T_base_to_ee(action):
 # ============================================================
 
 def make_T(R, t):
-    """
-    Build a homogeneous transform from a rotation matrix and translation.
-    """
-
     T = np.eye(4, dtype=np.float64)
     T[:3, :3] = np.asarray(R, dtype=np.float64)
     T[:3, 3] = np.asarray(t, dtype=np.float64).reshape(3)
-
     return T
 
 
 def rvec_tvec_to_T(rvec, tvec):
     """
-    Convert OpenCV solvePnP output into a 4x4 transform.
-
-    solvePnP returns:
-        rvec, tvec
-
-    Here that represents:
-        T_camera_to_board
-
-    because it maps board object points into the camera frame.
+    Convert solvePnP output to T_camera_to_board.
     """
 
     R, _ = cv2.Rodrigues(rvec)
-
     return make_T(R, tvec)
 
 
@@ -254,21 +327,34 @@ def rvec_tvec_to_T(rvec, tvec):
 
 def send_and_save_pose(robot, action):
     """
-    Send the joint command to the robot and save the same command to JSON.
+    Send action to robot, save pose JSON, and save FK JSON.
+
+    Joint 6 is free and offset-corrected only for FK.
     """
 
-    action["gripper.pos"] = GRIPPER_FIXED_DEG
+    final_action = {}
 
-    robot.send_action(action)
+    for name in joint_names:
+        min_lim, max_lim = joint_limits[name]
 
-    save_current_pose(action)
+        final_action[name] = float(
+            clamp(
+                float(action[name]),
+                min_lim,
+                max_lim,
+            )
+        )
+
+    robot.send_action(final_action)
+
+    save_current_pose(final_action)
+
+    return final_action
 
 
 def move_smooth(robot, target_action):
     """
-    Smoothly move the robot to a target joint pose.
-
-    This is used for home/rest moves.
+    Smoothly move robot to target joint pose.
     """
 
     global current_action
@@ -277,28 +363,30 @@ def move_smooth(robot, target_action):
 
     for name in joint_names:
         if name in target_action:
-            final_action[name] = float(target_action[name])
+            min_lim, max_lim = joint_limits[name]
 
-    final_action["gripper.pos"] = GRIPPER_FIXED_DEG
+            final_action[name] = clamp(
+                float(target_action[name]),
+                min_lim,
+                max_lim,
+            )
 
     current = np.array(
         [current_action[name] for name in joint_names],
-        dtype=float
+        dtype=float,
     )
 
     target = np.array(
         [final_action[name] for name in joint_names],
-        dtype=float
+        dtype=float,
     )
 
     diff = target - current
     max_diff = np.max(np.abs(diff))
-
     n_steps = max(1, int(np.ceil(max_diff / STEP_DEG)))
 
     for i in range(1, n_steps + 1):
         alpha = i / n_steps
-
         intermediate = current + alpha * diff
 
         action = {
@@ -306,15 +394,11 @@ def move_smooth(robot, target_action):
             for idx, name in enumerate(joint_names)
         }
 
-        action["gripper.pos"] = GRIPPER_FIXED_DEG
-
-        send_and_save_pose(robot, action)
+        current_action = send_and_save_pose(robot, action)
 
         time.sleep(COMMAND_DELAY)
 
     current_action = final_action
-    current_action["gripper.pos"] = GRIPPER_FIXED_DEG
-
     save_current_pose(current_action)
 
 
@@ -323,16 +407,6 @@ def move_smooth(robot, target_action):
 # ============================================================
 
 def get_zed_intrinsics(zed):
-    """
-    Read left-camera intrinsics from the ZED SDK.
-
-    K:
-        camera matrix used by solvePnP
-
-    dist:
-        distortion coefficients
-    """
-
     cam_info = zed.get_camera_information()
     calib = cam_info.camera_configuration.calibration_parameters.left_cam
 
@@ -344,15 +418,38 @@ def get_zed_intrinsics(zed):
 
     dist = np.array(
         calib.disto,
-        dtype=np.float64
+        dtype=np.float64,
     ).reshape(-1, 1)
 
     return K, dist
 
 
 # ============================================================
-# ArUco pose estimation helper
+# ArUco board pose estimation
 # ============================================================
+
+def create_aruco_grid_board():
+    """
+    Create OpenCV GridBoard matching the physical board.
+
+    Physical board:
+        3 x 3 markers
+        marker length = 61.5 mm
+        marker gap = 3.72 mm
+    """
+
+    aruco = cv2.aruco
+    dictionary = aruco.getPredefinedDictionary(DICTIONARY_ID)
+
+    board = aruco.GridBoard(
+        (MARKERS_X, MARKERS_Y),
+        MARKER_LENGTH_M,
+        MARKER_SEPARATION_M,
+        dictionary,
+    )
+
+    return board, dictionary
+
 
 def estimate_board_pose_from_aruco_markers(
     board,
@@ -362,45 +459,13 @@ def estimate_board_pose_from_aruco_markers(
     dist,
 ):
     """
-    Estimate board pose using ONLY detected ArUco markers.
-
-    This avoids CharucoDetector completely.
-
-    Why this function exists:
-        Your camera detects the ArUco markers successfully, but the
-        ChArUco corner detector is not giving a valid pose. So this
-        function manually matches detected marker IDs to the board's known
-        3D marker corner coordinates.
-
-    Inputs:
-        board:
-            OpenCV CharucoBoard object
-
-        marker_corners:
-            detected 2D image corners from ArucoDetector
-
-        marker_ids:
-            detected marker IDs from ArucoDetector
-
-        K, dist:
-            camera intrinsics and distortion
-
-    Output:
-        success:
-            True if solvePnP succeeds
-
-        rvec, tvec:
-            pose of the board relative to the camera
+    Estimate ArUco GridBoard pose using detected marker corners.
     """
 
-    if marker_ids is None or len(marker_ids) < 4:
+    if marker_ids is None or len(marker_ids) < 2:
         return False, None, None
 
-    # The board knows which marker IDs exist on it.
     board_ids = board.getIds().flatten()
-
-    # The board also knows the 3D object coordinates of every marker corner.
-    # Each item is a 4x3 set of 3D points.
     board_obj_points = board.getObjPoints()
 
     obj_points = []
@@ -408,33 +473,29 @@ def estimate_board_pose_from_aruco_markers(
 
     for detected_idx, detected_id in enumerate(marker_ids.flatten()):
 
-        # Find where this detected marker ID appears in the board model.
+        detected_id = int(detected_id)
+
         matches = np.where(board_ids == detected_id)[0]
 
-        # Ignore marker IDs that are not part of this board.
         if len(matches) == 0:
             continue
 
-        board_idx = matches[0]
+        board_idx = int(matches[0])
 
-        # 3D marker corners in board frame.
         obj_corners = np.asarray(
             board_obj_points[board_idx],
-            dtype=np.float32
+            dtype=np.float32,
         ).reshape(4, 3)
 
-        # 2D marker corners in image frame.
         img_corners = np.asarray(
             marker_corners[detected_idx],
-            dtype=np.float32
+            dtype=np.float32,
         ).reshape(4, 2)
 
         obj_points.append(obj_corners)
         img_points.append(img_corners)
 
-    # Need enough marker corners for stable PnP.
-    # 4 markers = 16 points.
-    if len(obj_points) < 4:
+    if len(obj_points) < 2:
         return False, None, None
 
     obj_points = np.vstack(obj_points).astype(np.float32)
@@ -464,23 +525,6 @@ def save_sample(
     K,
     dist,
 ):
-    """
-    Save one hand-eye calibration sample.
-
-    Each sample contains:
-
-        Robot side:
-            T_base_to_ee
-
-        Camera side:
-            T_camera_to_board
-
-    Later the solver uses:
-        T_base_to_ee * T_ee_to_board
-        =
-        T_base_to_camera * T_camera_to_board
-    """
-
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     T_base_to_ee_list.append(T_base_to_ee)
@@ -488,12 +532,12 @@ def save_sample(
 
     np.save(
         OUTPUT_DIR / f"T_base_to_ee_{sample_id:03d}.npy",
-        T_base_to_ee
+        T_base_to_ee,
     )
 
     np.save(
         OUTPUT_DIR / f"T_camera_to_board_{sample_id:03d}.npy",
-        T_camera_to_board
+        T_camera_to_board,
     )
 
     np.savez(
@@ -510,10 +554,6 @@ def save_sample(
 # ============================================================
 
 def safe_addstr(stdscr, y, x, text):
-    """
-    Print text in curses without crashing if terminal is too small.
-    """
-
     h, w = stdscr.getmaxyx()
 
     if y >= h:
@@ -534,10 +574,6 @@ def draw_screen(
     sample_count,
     num_markers,
 ):
-    """
-    Draw terminal UI.
-    """
-
     stdscr.clear()
 
     safe_addstr(stdscr, 0, 0, "SO-101 Eye-to-Hand Keyboard Collection")
@@ -550,15 +586,17 @@ def draw_screen(
     safe_addstr(stdscr, 7, 2, "h           : move home")
     safe_addstr(stdscr, 8, 2, "r           : move rest")
     safe_addstr(stdscr, 9, 2, "s           : save calibration sample")
-    safe_addstr(stdscr, 10, 2, "q           : quit")
+    safe_addstr(stdscr, 10, 2, "p           : print/save current T_base_to_ee")
+    safe_addstr(stdscr, 11, 2, "q           : quit")
 
-    safe_addstr(stdscr, 12, 0, f"Board pose detected: {detected}")
-    safe_addstr(stdscr, 13, 0, f"Markers detected   : {num_markers}")
-    safe_addstr(stdscr, 14, 0, f"Samples saved      : {sample_count}")
-    safe_addstr(stdscr, 15, 0, f"Pose file          : {POSE_FILE}")
-    safe_addstr(stdscr, 16, 0, f"Joint 6 fixed      : {GRIPPER_FIXED_DEG:.1f} deg")
+    safe_addstr(stdscr, 13, 0, f"Board pose detected: {detected}")
+    safe_addstr(stdscr, 14, 0, f"Markers detected   : {num_markers}")
+    safe_addstr(stdscr, 15, 0, f"Samples saved      : {sample_count}")
+    safe_addstr(stdscr, 16, 0, f"Pose JSON          : {POSE_FILE}")
+    safe_addstr(stdscr, 17, 0, f"FK JSON            : {FK_FILE}")
+    safe_addstr(stdscr, 18, 0, "Joint 6            : free / offset-corrected in FK")
 
-    safe_addstr(stdscr, 18, 0, "Current joints:")
+    safe_addstr(stdscr, 20, 0, "Current joints:")
 
     for i, name in enumerate(joint_names):
         marker = "->" if i == active_joint_idx else "  "
@@ -568,7 +606,7 @@ def draw_screen(
 
         safe_addstr(
             stdscr,
-            20 + i,
+            22 + i,
             0,
             f"{marker} {label:15s}: {value:8.2f} deg   limits [{min_lim:.1f}, {max_lim:.1f}]",
         )
@@ -581,17 +619,6 @@ def draw_screen(
 # ============================================================
 
 def keyboard_control(stdscr, robot):
-    """
-    Main collection loop.
-
-    This loop:
-        1. Reads the ZED image.
-        2. Detects ArUco markers.
-        3. Estimates board pose from marker corners.
-        4. Lets you move the robot using keyboard.
-        5. Saves a calibration sample when pressing 's'.
-    """
-
     global current_action
 
     curses.curs_set(0)
@@ -601,7 +628,6 @@ def keyboard_control(stdscr, robot):
     active_joint_idx = 0
 
     load_current_pose_if_available()
-    current_action["gripper.pos"] = GRIPPER_FIXED_DEG
     save_current_pose(current_action)
 
     # --------------------------------------------------------
@@ -611,13 +637,11 @@ def keyboard_control(stdscr, robot):
     zed = sl.Camera()
 
     init_params = sl.InitParameters()
-    init_params.camera_resolution = sl.RESOLUTION.HD1080
+    init_params.camera_resolution = sl.RESOLUTION.HD720
     init_params.camera_fps = 30
     init_params.coordinate_units = sl.UNIT.METER
     init_params.depth_mode = sl.DEPTH_MODE.NEURAL
 
-    # OpenCV-friendly image coordinate system:
-    # X right, Y down, Z forward.
     init_params.coordinate_system = sl.COORDINATE_SYSTEM.IMAGE
 
     status = zed.open(init_params)
@@ -631,57 +655,19 @@ def keyboard_control(stdscr, robot):
     K, dist = get_zed_intrinsics(zed)
 
     # --------------------------------------------------------
-    # ArUco detector setup
+    # ArUco setup
     # --------------------------------------------------------
 
     aruco = cv2.aruco
 
-    dictionary = aruco.getPredefinedDictionary(
-        aruco.DICT_5X5_100
-    )
+    board, dictionary = create_aruco_grid_board()
 
     detector_params = aruco.DetectorParameters()
 
     detector = aruco.ArucoDetector(
         dictionary,
-        detector_params
+        detector_params,
     )
-
-    # --------------------------------------------------------
-    # Board model
-    # --------------------------------------------------------
-    #
-    # Your printed target is visually ChArUco:
-    #
-    #   squares_x = 8
-    #   squares_y = 8
-    #   square size = 10 mm
-    #   marker size = 7 mm
-    #   dictionary = DICT_5X5
-    #
-    # We still create a CharucoBoard because it stores the correct
-    # 3D coordinates of the embedded ArUco markers.
-    #
-    # But we do NOT use CharucoDetector here.
-    # We only use ArucoDetector and solvePnP.
-    # --------------------------------------------------------
-
-    squares_x = 8
-    squares_y = 8
-
-    square_length = 0.010
-    marker_length = 0.007
-
-    board = aruco.CharucoBoard(
-        (squares_x, squares_y),
-        square_length,
-        marker_length,
-        dictionary,
-    )
-
-    # --------------------------------------------------------
-    # Calibration sample storage
-    # --------------------------------------------------------
 
     T_base_to_ee_list = []
     T_camera_to_board_list = []
@@ -695,53 +681,37 @@ def keyboard_control(stdscr, robot):
     try:
         while True:
 
-            # ====================================================
-            # Camera processing
-            # ====================================================
-
             if zed.grab(runtime) == sl.ERROR_CODE.SUCCESS:
                 zed.retrieve_image(image_zed, sl.VIEW.LEFT)
                 frame = image_zed.get_data()
 
-                # ZED image can be BGRA.
                 if frame.shape[2] == 4:
                     frame_bgr = cv2.cvtColor(
                         frame,
-                        cv2.COLOR_BGRA2BGR
+                        cv2.COLOR_BGRA2BGR,
                     )
                 else:
                     frame_bgr = frame.copy()
 
                 gray = cv2.cvtColor(
                     frame_bgr,
-                    cv2.COLOR_BGR2GRAY
+                    cv2.COLOR_BGR2GRAY,
                 )
 
-                # --------------------------------------------
-                # Detect ArUco markers
-                # --------------------------------------------
-
                 marker_corners, marker_ids, rejected = detector.detectMarkers(
-                    gray
+                    gray,
                 )
 
                 detected = False
                 T_camera_to_board = None
-
                 num_markers = 0 if marker_ids is None else len(marker_ids)
 
                 if marker_ids is not None and len(marker_ids) > 0:
-
-                    # Draw detected marker outlines and IDs.
                     aruco.drawDetectedMarkers(
                         frame_bgr,
                         marker_corners,
                         marker_ids,
                     )
-
-                # --------------------------------------------
-                # Estimate board pose
-                # --------------------------------------------
 
                 success, rvec, tvec = estimate_board_pose_from_aruco_markers(
                     board,
@@ -753,25 +723,16 @@ def keyboard_control(stdscr, robot):
 
                 if success:
                     detected = True
+                    T_camera_to_board = rvec_tvec_to_T(rvec, tvec)
 
-                    T_camera_to_board = rvec_tvec_to_T(
-                        rvec,
-                        tvec
-                    )
-
-                    # Draw coordinate axes at board origin.
                     cv2.drawFrameAxes(
                         frame_bgr,
                         K,
                         dist,
                         rvec,
                         tvec,
-                        0.03,
+                        0.08,
                     )
-
-                # --------------------------------------------
-                # Image overlay
-                # --------------------------------------------
 
                 cv2.putText(
                     frame_bgr,
@@ -785,14 +746,10 @@ def keyboard_control(stdscr, robot):
 
                 cv2.imshow(
                     "ZED Eye-to-Hand Collection",
-                    frame_bgr
+                    frame_bgr,
                 )
 
                 cv2.waitKey(1)
-
-            # ====================================================
-            # Terminal UI
-            # ====================================================
 
             draw_screen(
                 stdscr,
@@ -808,49 +765,32 @@ def keyboard_control(stdscr, robot):
                 time.sleep(0.01)
                 continue
 
-            # ----------------------------------------------------
-            # Quit
-            # ----------------------------------------------------
-
             if key == ord("q"):
                 break
-
-            # ----------------------------------------------------
-            # Move to home
-            # ----------------------------------------------------
 
             elif key == ord("h"):
                 move_smooth(robot, home)
 
-            # ----------------------------------------------------
-            # Move to rest
-            # ----------------------------------------------------
-
             elif key == ord("r"):
                 move_smooth(robot, rest)
 
-            # ----------------------------------------------------
-            # Save sample
-            # ----------------------------------------------------
+            elif key == ord("p"):
+                print_robot_transform(current_action)
 
             elif key == ord("s"):
                 if not detected or T_camera_to_board is None:
                     safe_addstr(
                         stdscr,
-                        28,
+                        30,
                         0,
-                        "Cannot save: board pose not detected."
+                        "Cannot save: board pose not detected.",
                     )
                     stdscr.refresh()
                     time.sleep(0.5)
                     continue
 
-                # Robot-side pose from forward kinematics.
-                T_base_to_ee = action_to_T_base_to_ee(
-                    current_action
-                )
+                T_base_to_ee = action_to_T_base_to_ee(current_action)
 
-                # Camera-side pose from marker board detection.
                 save_sample(
                     sample_id,
                     T_base_to_ee,
@@ -861,29 +801,23 @@ def keyboard_control(stdscr, robot):
                     dist,
                 )
 
-                sample_id += 1
+                save_fk_json(current_action)
 
-            # ----------------------------------------------------
-            # Switch active joint
-            # ----------------------------------------------------
+                print("\n[SAVED] Sample", sample_id)
+                print("T_base_to_ee:")
+                print(T_base_to_ee)
+                print("T_camera_to_board:")
+                print(T_camera_to_board)
+                print(f"FK JSON saved to: {FK_FILE}")
+
+                sample_id += 1
 
             elif key == 9:
                 active_joint_idx = (
                     active_joint_idx + 1
                 ) % len(joint_names)
 
-                # Skip gripper because fixed.
-                if joint_names[active_joint_idx] == "gripper.pos":
-                    active_joint_idx = (
-                        active_joint_idx + 1
-                    ) % len(joint_names)
-
-            # ----------------------------------------------------
-            # Joint movement
-            # ----------------------------------------------------
-
             elif key in [curses.KEY_LEFT, curses.KEY_RIGHT]:
-
                 joint = joint_names[active_joint_idx]
 
                 direction = (
@@ -898,11 +832,9 @@ def keyboard_control(stdscr, robot):
                     max_lim,
                 )
 
-                current_action["gripper.pos"] = GRIPPER_FIXED_DEG
-
-                send_and_save_pose(
+                current_action = send_and_save_pose(
                     robot,
-                    dict(current_action)
+                    dict(current_action),
                 )
 
                 time.sleep(COMMAND_DELAY)
@@ -931,7 +863,7 @@ def main():
 
         curses.wrapper(
             keyboard_control,
-            robot
+            robot,
         )
 
     finally:

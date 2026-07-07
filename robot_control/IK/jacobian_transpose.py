@@ -20,7 +20,7 @@ def jacobian_transpose_position(
     q_min=None,
     q_max=None,
     K=None,
-    print_iterations=True,
+    print_iterations=False,
 ):
     """
     Numerical inverse kinematics for position only using

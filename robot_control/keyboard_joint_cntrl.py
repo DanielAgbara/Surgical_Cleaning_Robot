@@ -39,8 +39,8 @@ ROBOT_ID = "dbot"
 # Motion settings
 # --------------------------------------------------
 
-STEP_DEG = 2.0
-GRIPPER_STEP = 5.0
+STEP_DEG = 1.0
+GRIPPER_STEP = 1.0
 COMMAND_DELAY = 0.03
 
 
