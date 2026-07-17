@@ -160,6 +160,31 @@ def RToQuaternion(R, eps=1e-6):
     Q = Q / np.linalg.norm(Q)
     return Q
 
+def QuaternionToR(Q):
+    Q = np.asarray(Q, dtype=float)
+    q0, q1, q2, q3 = Q
+    R = np.array(
+        [
+            [
+                q0 * q0 + q1 * q1 - q2 * q2 - q3 * q3,
+                2 * (q1 * q2 - q0 * q3),
+                2 * (q0 * q2 + q1 * q3),
+            ],
+            [
+                2 * (q0 * q3 + q1 * q2),
+                q0 * q0 - q1 * q1 + q2 * q2 - q3 * q3,
+                2 * (q2 * q3 - q0 * q1),
+            ],
+            [
+                2 * (q1 * q3 - q0 * q2),
+                2 * (q0 * q1 + q2 * q3),
+                q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3,
+            ],
+        ]
+    )
+
+    return R
+
 
 def skew(w: np.ndarray) -> np.ndarray:
     """

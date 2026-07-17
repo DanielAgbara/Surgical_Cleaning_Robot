@@ -98,9 +98,9 @@ rest = {
     "shoulder_pan.pos": 0.0,
     "shoulder_lift.pos": -95.0,
     "elbow_flex.pos": 95.0,
-    "wrist_flex.pos": 0.0,
+    "wrist_flex.pos": -90.0,
     "wrist_roll.pos": 0.0,
-    "gripper.pos": 0.0,
+    "gripper.pos": 100.0,
 }
 
 

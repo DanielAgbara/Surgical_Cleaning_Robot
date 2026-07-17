@@ -19,7 +19,6 @@ from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
 ROOT = Path("/home/agbara-admin/Documents/Surgical_Cleaning_Robot")
 IK_PATH = ROOT / "robot_control" / "Teleoperation"
-sys.path.insert(0, str(IK_PATH))
 
 from robot import (
     M,
@@ -31,6 +30,11 @@ from robot import (
     rest as robot_rest,
 )
 
+
+
+UTIL_PATH = ROOT / "robot_control" / "Util"
+sys.path.insert(0, str(UTIL_PATH))
+from so3 import RToQuaternion
 from fk import space_product_of_exponentials
 
 
@@ -40,6 +44,11 @@ from fk import space_product_of_exponentials
 
 POSE_FILE = ROOT / "data" / "eye_to_hand" / "current_robot_pose.json"
 FK_FILE = ROOT / "data" / "eye_to_hand" /"current_robot_fk.json"
+
+ROBOT_Q_FILE = ROOT / "data" / "eye_to_hand" / "robot_q.json"
+ROBOT_T_FILE = ROOT / "data" / "eye_to_hand" / "robot_t.json"
+CAMERA_Q_FILE = ROOT / "data" / "eye_to_hand" / "camera_q.json"
+CAMERA_T_FILE = ROOT / "data" / "eye_to_hand" / "camera_t.json"
 
 OUTPUT_DIR = ROOT / "data" / "eye_to_hand"
 
@@ -51,7 +60,7 @@ OUTPUT_DIR = ROOT / "data" / "eye_to_hand"
 ROBOT_PORT = "/dev/ttyACM0"
 ROBOT_ID = "dbot"
 
-STEP_DEG = 2.0
+STEP_DEG = 1.0
 COMMAND_DELAY = 0.03
 
 
@@ -109,16 +118,17 @@ current_action = dict(rest)
 
 def delete_old_calibration_samples():
     """
-    Delete old eye-to-hand calibration files before starting
-    a new calibration run.
+    Delete old calibration JSON files before starting a new
+    eye-to-hand calibration session.
     """
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     patterns = [
-        "T_base_to_ee_*.npy",
-        "T_camera_to_board_*.npy",
-        "eye_to_hand_samples.npz",
+        "robot_q.json",
+        "robot_t.json",
+        "camera_q.json",
+        "camera_t.json",
         "T_base_to_camera.npy",
         "T_ee_to_board.npy",
     ]
@@ -511,43 +521,182 @@ def estimate_board_pose_from_aruco_markers(
 
     return success, rvec, tvec
 
+# ============================================================
+# Save current camera -> board transform
+# ============================================================
+
+CURRENT_CAMERA_BOARD_FILE = (
+    OUTPUT_DIR / "current_camera_board.json"
+)
+
+
+def save_current_camera_board(T_camera_to_board):
+    """
+    Save the current camera-to-board transform.
+
+    The rotation is stored as a quaternion [w, x, y, z].
+
+    The translation is stored as [x, y, z].
+
+    This file is overwritten every frame and is intended
+    only for debugging.
+    """
+
+    R = T_camera_to_board[:3, :3]
+    t = T_camera_to_board[:3, 3]
+
+    q = RToQuaternion(R)
+
+    data = {
+        "quaternion": [
+            float(q[0]),
+            float(q[1]),
+            float(q[2]),
+            float(q[3]),
+        ],
+        "translation": [
+            float(t[0]),
+            float(t[1]),
+            float(t[2]),
+        ],
+        "transform": T_camera_to_board.tolist(),
+    }
+
+    with open(CURRENT_CAMERA_BOARD_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
 
 # ============================================================
 # Calibration sample saving
 # ============================================================
 
 def save_sample(
-    sample_id,
     T_base_to_ee,
     T_camera_to_board,
-    T_base_to_ee_list,
-    T_camera_to_board_list,
-    K,
-    dist,
 ):
+    """
+    Save one calibration sample.
+
+    Each sample is stored as:
+
+        robot_q.json
+        robot_t.json
+        camera_q.json
+        camera_t.json
+
+    Rotations are stored as quaternions:
+        [w, x, y, z]
+
+    Translations are stored as:
+        [x, y, z]
+    """
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    T_base_to_ee_list.append(T_base_to_ee)
-    T_camera_to_board_list.append(T_camera_to_board)
+    # --------------------------------------------------------
+    # Robot end-effector pose
+    # --------------------------------------------------------
 
-    np.save(
-        OUTPUT_DIR / f"T_base_to_ee_{sample_id:03d}.npy",
+    append_transform_to_json(
         T_base_to_ee,
+        ROBOT_Q_FILE,
+        ROBOT_T_FILE,
     )
 
-    np.save(
-        OUTPUT_DIR / f"T_camera_to_board_{sample_id:03d}.npy",
+    # --------------------------------------------------------
+    # Camera board pose
+    # --------------------------------------------------------
+
+    append_transform_to_json(
         T_camera_to_board,
+        CAMERA_Q_FILE,
+        CAMERA_T_FILE,
     )
 
-    np.savez(
-        OUTPUT_DIR / "eye_to_hand_samples.npz",
-        T_base_to_ee=np.array(T_base_to_ee_list),
-        T_camera_to_board=np.array(T_camera_to_board_list),
-        K=K,
-        dist=dist,
-    )
 
+# ============================================================
+# Quaternion JSON export
+# ============================================================
+
+def append_transform_to_json(
+    T,
+    q_file,
+    t_file,
+):
+    """
+    Append one transform to the quaternion and translation files.
+
+    Quaternion file format:
+        [
+            [w, x, y, z],
+            [w, x, y, z],
+            ...
+        ]
+
+    Translation file format:
+        [
+            [x, y, z],
+            [x, y, z],
+            ...
+        ]
+    """
+
+    # --------------------------------------------------------
+    # Extract rotation and translation
+    # --------------------------------------------------------
+
+    R = T[:3, :3]
+    t = T[:3, 3]
+
+    # Convert rotation matrix to quaternion using so3.py
+    q = RToQuaternion(R)
+
+    # --------------------------------------------------------
+    # Load existing quaternion data
+    # --------------------------------------------------------
+
+    if q_file.exists():
+        with open(q_file, "r") as f:
+            q_data = json.load(f)
+    else:
+        q_data = []
+
+    # --------------------------------------------------------
+    # Load existing translation data
+    # --------------------------------------------------------
+
+    if t_file.exists():
+        with open(t_file, "r") as f:
+            t_data = json.load(f)
+    else:
+        t_data = []
+
+    # --------------------------------------------------------
+    # Append current sample
+    # --------------------------------------------------------
+
+    q_data.append([
+        float(q[0]),
+        float(q[1]),
+        float(q[2]),
+        float(q[3]),
+    ])
+
+    t_data.append([
+        float(t[0]),
+        float(t[1]),
+        float(t[2]),
+    ])
+
+    # --------------------------------------------------------
+    # Save updated JSON files
+    # --------------------------------------------------------
+
+    with open(q_file, "w") as f:
+        json.dump(q_data, f, indent=4)
+
+    with open(t_file, "w") as f:
+        json.dump(t_data, f, indent=4)
 
 # ============================================================
 # Safe curses display
@@ -641,7 +790,6 @@ def keyboard_control(stdscr, robot):
     init_params.camera_fps = 30
     init_params.coordinate_units = sl.UNIT.METER
     init_params.depth_mode = sl.DEPTH_MODE.NEURAL
-
     init_params.coordinate_system = sl.COORDINATE_SYSTEM.IMAGE
 
     status = zed.open(init_params)
@@ -724,6 +872,8 @@ def keyboard_control(stdscr, robot):
                 if success:
                     detected = True
                     T_camera_to_board = rvec_tvec_to_T(rvec, tvec)
+                    
+                    save_current_camera_board(T_camera_to_board)
 
                     cv2.drawFrameAxes(
                         frame_bgr,
@@ -790,15 +940,10 @@ def keyboard_control(stdscr, robot):
                     continue
 
                 T_base_to_ee = action_to_T_base_to_ee(current_action)
-
+                
                 save_sample(
-                    sample_id,
                     T_base_to_ee,
                     T_camera_to_board,
-                    T_base_to_ee_list,
-                    T_camera_to_board_list,
-                    K,
-                    dist,
                 )
 
                 save_fk_json(current_action)

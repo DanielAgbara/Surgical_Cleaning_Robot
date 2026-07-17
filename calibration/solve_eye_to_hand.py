@@ -1,249 +1,616 @@
+#!/usr/bin/env python3
+
+import sys
+import json
 from pathlib import Path
 
-import cv2
 import numpy as np
 from scipy.optimize import least_squares
 
 
-ROOT = Path(__file__).resolve().parents[1]
-DATA_PATH = ROOT / "data" / "eye_to_hand" / "eye_to_hand_samples.npz"
-OUT_DIR = ROOT / "data" / "eye_to_hand"
+# ============================================================
+# Paths
+# ============================================================
+
+ROOT = Path("/home/agbara-admin/Documents/Surgical_Cleaning_Robot")
+DATA_DIR = ROOT / "data" / "eye_to_hand"
+
+UTIL_PATH = ROOT / "robot_control" / "Util"
+sys.path.insert(0, str(UTIL_PATH))
+
+from so3 import QuaternionToR, RToQuaternion
 
 
-# Rotation residual weight.
-# 0.03 means 1 rad rotation error is treated like about 30 mm translation error.
-ROT_WEIGHT = 0.03
+ROBOT_Q_FILE = DATA_DIR / "robot_q.json"
+ROBOT_T_FILE = DATA_DIR / "robot_t.json"
 
-# Robust loss settings.
-# Helps prevent a few bad samples from dominating the solution.
-ROBUST_LOSS = "huber"
-ROBUST_F_SCALE = 0.01
+CAMERA_Q_FILE = DATA_DIR / "camera_q.json"
+CAMERA_T_FILE = DATA_DIR / "camera_t.json"
 
+OUT_T_BASE_TO_CAMERA = DATA_DIR / "T_base_to_camera.npy"
+OUT_T_EE_TO_BOARD = DATA_DIR / "T_ee_to_board.npy"
+
+
+# ============================================================
+# Quaternion helpers
+# Quaternion convention: [w, x, y, z]
+# ============================================================
+
+def normalize_quaternion(q):
+    q = np.asarray(q, dtype=float).reshape(4)
+    norm = np.linalg.norm(q)
+
+    if norm < 1e-12:
+        raise ValueError("Quaternion norm is too small.")
+
+    q = q / norm
+
+    # Keep sign consistent.
+    if q[0] < 0:
+        q = -q
+
+    return q
+
+
+def quat_conjugate(q):
+    q = normalize_quaternion(q)
+
+    return np.array([
+        q[0],
+        -q[1],
+        -q[2],
+        -q[3],
+    ], dtype=float)
+
+
+def quat_multiply(q1, q2):
+    """
+    Hamilton product.
+
+    q = q1 * q2
+    """
+
+    w1, x1, y1, z1 = normalize_quaternion(q1)
+    w2, x2, y2, z2 = normalize_quaternion(q2)
+
+    return normalize_quaternion(np.array([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    ], dtype=float))
+
+
+def quat_inverse(q):
+    return quat_conjugate(q)
+
+
+def rotation_error_vector(q_left, q_right):
+    """
+    Rotation residual between two orientations.
+
+    q_err = inverse(q_left) * q_right
+
+    For small rotations:
+        vector part of q_err ≈ 0.5 * rotation_vector
+
+    So we return 2 * vector part.
+    """
+
+    q_err = quat_multiply(
+        quat_inverse(q_left),
+        q_right,
+    )
+
+    if q_err[0] < 0:
+        q_err = -q_err
+
+    return 2.0 * q_err[1:4]
+
+
+# ============================================================
+# Transform helpers
+# ============================================================
 
 def make_T(R, t):
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = np.asarray(R, dtype=np.float64)
-    T[:3, 3] = np.asarray(t, dtype=np.float64).reshape(3)
+    T = np.eye(4, dtype=float)
+    T[:3, :3] = np.asarray(R, dtype=float).reshape(3, 3)
+    T[:3, 3] = np.asarray(t, dtype=float).reshape(3)
+
     return T
 
 
-def invert_T(T):
+def transform_from_q_t(q, t):
+    q = normalize_quaternion(q)
+    R = QuaternionToR(q)
+
+    return make_T(R, t)
+
+
+def q_t_from_T(T):
     R = T[:3, :3]
     t = T[:3, 3]
 
-    T_inv = np.eye(4, dtype=np.float64)
-    T_inv[:3, :3] = R.T
-    T_inv[:3, 3] = -R.T @ t
+    q = RToQuaternion(R)
+    q = normalize_quaternion(q)
 
-    return T_inv
-
-
-def params_to_T(rvec, tvec):
-    R, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
-    return make_T(R, tvec)
+    return q, t
 
 
-def T_to_params(T):
-    rvec, _ = cv2.Rodrigues(T[:3, :3])
-    tvec = T[:3, 3]
-    return rvec.reshape(3), tvec.reshape(3)
+# ============================================================
+# Loading data
+# ============================================================
+
+def load_json_array(path):
+    if not path.exists():
+        raise FileNotFoundError(f"Missing file: {path}")
+
+    with open(path, "r") as f:
+        data = json.load(f)
+
+    return np.asarray(data, dtype=float)
 
 
-def rotation_error_deg(R):
-    value = (np.trace(R) - 1.0) / 2.0
-    value = np.clip(value, -1.0, 1.0)
-    return np.degrees(np.arccos(value))
+def load_calibration_data():
+    robot_q = load_json_array(ROBOT_Q_FILE)
+    robot_t = load_json_array(ROBOT_T_FILE)
+
+    camera_q = load_json_array(CAMERA_Q_FILE)
+    camera_t = load_json_array(CAMERA_T_FILE)
+
+    n = len(robot_q)
+
+    if not (
+        len(robot_t) == n
+        and len(camera_q) == n
+        and len(camera_t) == n
+    ):
+        raise RuntimeError(
+            "JSON files have different sample counts."
+        )
+
+    if n < 8:
+        raise RuntimeError(
+            f"Only {n} samples found. Need at least 8. Prefer 25-40."
+        )
+
+    robot_q = np.array([
+        normalize_quaternion(q)
+        for q in robot_q
+    ])
+
+    camera_q = np.array([
+        normalize_quaternion(q)
+        for q in camera_q
+    ])
+
+    return robot_q, robot_t, camera_q, camera_t
 
 
-def se3_error(T_err):
+# ============================================================
+# Initial guess
+# ============================================================
+
+def make_initial_guess():
     """
-    Convert transform error into optimizer residual.
+    Unknowns:
 
-    Translation is in meters.
-    Rotation is in radians, scaled by ROT_WEIGHT.
+        q_base_camera = x[0:4]
+        t_base_camera = x[4:7]
+
+        q_ee_board    = x[7:11]
+        t_ee_board    = x[11:14]
+
+    Initial values are rough guesses.
     """
 
-    rvec, _ = cv2.Rodrigues(T_err[:3, :3])
-    tvec = T_err[:3, 3]
+    q_base_camera = np.array([1.0, 0.0, 0.0, 0.0])
+    t_base_camera = np.array([-0.10, 0.60, 0.60])
+
+    q_ee_board = np.array([1.0, 0.0, 0.0, 0.0])
+    t_ee_board = np.array([0.01, 0.00, 0.0])
 
     return np.hstack([
-        tvec,
-        ROT_WEIGHT * rvec.reshape(3),
+        q_base_camera,
+        t_base_camera,
+        q_ee_board,
+        t_ee_board,
     ])
 
 
-def residual(x, T_base_to_ee_list, T_camera_to_board_list):
-    r_base_cam = x[0:3]
-    t_base_cam = x[3:6]
+def unpack_x(x):
+    q_base_camera = normalize_quaternion(x[0:4])
+    t_base_camera = np.asarray(x[4:7], dtype=float)
 
-    r_ee_board = x[6:9]
-    t_ee_board = x[9:12]
+    q_ee_board = normalize_quaternion(x[7:11])
+    t_ee_board = np.asarray(x[11:14], dtype=float)
 
-    T_base_to_camera = params_to_T(r_base_cam, t_base_cam)
-    T_ee_to_board = params_to_T(r_ee_board, t_ee_board)
+    return (
+        q_base_camera,
+        t_base_camera,
+        q_ee_board,
+        t_ee_board,
+    )
+
+
+# ============================================================
+# Residual
+# ============================================================
+
+def residual(
+    x,
+    robot_q,
+    robot_t,
+    camera_q,
+    camera_t,
+    rotation_weight=0.03,
+):
+    """
+    Solve the absolute pose equation:
+
+        T_base_to_ee(i) * T_ee_to_board
+        =
+        T_base_to_camera * T_camera_to_board(i)
+
+    Rotation part:
+
+        q_base_ee(i) * q_ee_board
+        =
+        q_base_camera * q_camera_board(i)
+
+    Translation part:
+
+        t_base_ee(i) + R_base_ee(i) * t_ee_board
+        =
+        t_base_camera + R_base_camera * t_camera_board(i)
+    """
+
+    (
+        q_base_camera,
+        t_base_camera,
+        q_ee_board,
+        t_ee_board,
+    ) = unpack_x(x)
+
+    R_base_camera = QuaternionToR(q_base_camera)
 
     errors = []
 
-    for T_base_to_ee, T_camera_to_board in zip(
-        T_base_to_ee_list,
-        T_camera_to_board_list,
-    ):
-        # Robot path:
+    for i in range(len(robot_q)):
+
+        q_base_ee = normalize_quaternion(robot_q[i])
+        t_base_ee = robot_t[i]
+
+        q_camera_board = normalize_quaternion(camera_q[i])
+        t_camera_board = camera_t[i]
+
+        R_base_ee = QuaternionToR(q_base_ee)
+
+        # ----------------------------------------------------
+        # Left chain:
         # base -> ee -> board
-        lhs = T_base_to_ee @ T_ee_to_board
+        # ----------------------------------------------------
 
-        # Camera path:
+        q_left = quat_multiply(
+            q_base_ee,
+            q_ee_board,
+        )
+
+        t_left = (
+            t_base_ee
+            + R_base_ee @ t_ee_board
+        )
+
+        # ----------------------------------------------------
+        # Right chain:
         # base -> camera -> board
-        rhs = T_base_to_camera @ T_camera_to_board
+        # ----------------------------------------------------
 
-        # Difference between both paths.
-        T_err = invert_T(lhs) @ rhs
+        q_right = quat_multiply(
+            q_base_camera,
+            q_camera_board,
+        )
 
-        errors.extend(se3_error(T_err))
+        t_right = (
+            t_base_camera
+            + R_base_camera @ t_camera_board
+        )
 
-    return np.array(errors, dtype=np.float64)
+        # ----------------------------------------------------
+        # Residuals
+        # ----------------------------------------------------
+
+        trans_err = t_left - t_right
+        rot_err = rotation_error_vector(
+            q_left,
+            q_right,
+        )
+
+        errors.extend(trans_err)
+        errors.extend(rotation_weight * rot_err)
+
+    return np.asarray(errors, dtype=float)
 
 
-def validate(
-    T_base_to_camera,
-    T_ee_to_board,
-    T_base_to_ee_list,
-    T_camera_to_board_list,
-    label="Validation error",
+# ============================================================
+# Solve
+# ============================================================
+
+def solve_eye_to_hand(
+    robot_q,
+    robot_t,
+    camera_q,
+    camera_t,
 ):
-    pos_errors = []
-    rot_errors = []
-
-    for T_base_to_ee, T_camera_to_board in zip(
-        T_base_to_ee_list,
-        T_camera_to_board_list,
-    ):
-        lhs = T_base_to_ee @ T_ee_to_board
-        rhs = T_base_to_camera @ T_camera_to_board
-
-        pos_error = np.linalg.norm(lhs[:3, 3] - rhs[:3, 3])
-        pos_errors.append(pos_error)
-
-        dR = lhs[:3, :3].T @ rhs[:3, :3]
-        rot_error = rotation_error_deg(dR)
-        rot_errors.append(rot_error)
-
-    pos_errors = np.asarray(pos_errors)
-    rot_errors = np.asarray(rot_errors)
-
-    print(f"\n{label}:")
-    print(f"Position mean: {np.mean(pos_errors) * 1000:.2f} mm")
-    print(f"Position median: {np.median(pos_errors) * 1000:.2f} mm")
-    print(f"Position max : {np.max(pos_errors) * 1000:.2f} mm")
-    print(f"Rotation mean: {np.mean(rot_errors):.2f} deg")
-    print(f"Rotation median: {np.median(rot_errors):.2f} deg")
-    print(f"Rotation max : {np.max(rot_errors):.2f} deg")
-
-    return pos_errors, rot_errors
-
-
-def solve_once(T_base_to_ee_list, T_camera_to_board_list):
-    """
-    Solve:
-        T_base_to_ee * T_ee_to_board
-        =
-        T_base_to_camera * T_camera_to_board
-    """
-
-    # Initial guess for base -> camera.
-    # Change this rough translation if your camera is obviously elsewhere.
-    T_base_to_camera_init = np.eye(4, dtype=np.float64)
-    T_base_to_camera_init[:3, 3] = np.array([0.1, 0.0, 0.3])
-
-    # Since the board is mounted directly on the end effector,
-    # this should be a small transform.
-    T_ee_to_board_init = np.eye(4, dtype=np.float64)
-    T_ee_to_board_init[:3, 3] = np.array([0.003, 0.0, 0.0])
-
-    r_bc, t_bc = T_to_params(T_base_to_camera_init)
-    r_eb, t_eb = T_to_params(T_ee_to_board_init)
-
-    x0 = np.hstack([r_bc, t_bc, r_eb, t_eb])
+    x0 = make_initial_guess()
 
     result = least_squares(
         residual,
         x0,
-        args=(T_base_to_ee_list, T_camera_to_board_list),
-        loss=ROBUST_LOSS,
-        f_scale=ROBUST_F_SCALE,
-        verbose=1,
+        args=(
+            robot_q,
+            robot_t,
+            camera_q,
+            camera_t,
+        ),
+        loss="huber",
+        f_scale=0.01,
         max_nfev=5000,
         xtol=1e-12,
         ftol=1e-12,
         gtol=1e-12,
+        verbose=1,
     )
 
-    x = result.x
+    (
+        q_base_camera,
+        t_base_camera,
+        q_ee_board,
+        t_ee_board,
+    ) = unpack_x(result.x)
 
-    T_base_to_camera = params_to_T(x[0:3], x[3:6])
-    T_ee_to_board = params_to_T(x[6:9], x[9:12])
+    T_base_to_camera = transform_from_q_t(
+        q_base_camera,
+        t_base_camera,
+    )
 
-    return T_base_to_camera, T_ee_to_board, result
+    T_ee_to_board = transform_from_q_t(
+        q_ee_board,
+        t_ee_board,
+    )
 
+    return (
+        T_base_to_camera,
+        T_ee_to_board,
+        q_base_camera,
+        t_base_camera,
+        q_ee_board,
+        t_ee_board,
+        result,
+    )
+
+
+# ============================================================
+# Validation
+# ============================================================
+
+def rotation_angle_error_deg(q_left, q_right):
+    q_err = quat_multiply(
+        quat_inverse(q_left),
+        q_right,
+    )
+
+    if q_err[0] < 0:
+        q_err = -q_err
+
+    q_err = normalize_quaternion(q_err)
+
+    angle = 2.0 * np.arccos(
+        np.clip(q_err[0], -1.0, 1.0)
+    )
+
+    return np.degrees(angle)
+
+
+def validate_solution(
+    q_base_camera,
+    t_base_camera,
+    q_ee_board,
+    t_ee_board,
+    robot_q,
+    robot_t,
+    camera_q,
+    camera_t,
+):
+    R_base_camera = QuaternionToR(q_base_camera)
+
+    pos_errors = []
+    rot_errors = []
+
+    for i in range(len(robot_q)):
+
+        q_base_ee = normalize_quaternion(robot_q[i])
+        t_base_ee = robot_t[i]
+
+        q_camera_board = normalize_quaternion(camera_q[i])
+        t_camera_board = camera_t[i]
+
+        R_base_ee = QuaternionToR(q_base_ee)
+
+        q_left = quat_multiply(
+            q_base_ee,
+            q_ee_board,
+        )
+
+        t_left = (
+            t_base_ee
+            + R_base_ee @ t_ee_board
+        )
+
+        q_right = quat_multiply(
+            q_base_camera,
+            q_camera_board,
+        )
+
+        t_right = (
+            t_base_camera
+            + R_base_camera @ t_camera_board
+        )
+
+        pos_errors.append(
+            np.linalg.norm(t_left - t_right)
+        )
+
+        rot_errors.append(
+            rotation_angle_error_deg(q_left, q_right)
+        )
+
+    pos_errors = np.asarray(pos_errors)
+    rot_errors = np.asarray(rot_errors)
+
+    print("\nValidation error:")
+    print(f"Position mean   : {np.mean(pos_errors) * 1000:.2f} mm")
+    print(f"Position median : {np.median(pos_errors) * 1000:.2f} mm")
+    print(f"Position max    : {np.max(pos_errors) * 1000:.2f} mm")
+
+    print(f"Rotation mean   : {np.mean(rot_errors):.2f} deg")
+    print(f"Rotation median : {np.median(rot_errors):.2f} deg")
+    print(f"Rotation max    : {np.max(rot_errors):.2f} deg")
+
+    return pos_errors, rot_errors
+
+
+# ============================================================
+# Save debug output
+# ============================================================
+
+def save_solution_debug(
+    q_base_camera,
+    t_base_camera,
+    q_ee_board,
+    t_ee_board,
+    pos_errors,
+    rot_errors,
+):
+    debug = {
+        "q_base_to_camera": [
+            float(v)
+            for v in q_base_camera
+        ],
+        "t_base_to_camera": [
+            float(v)
+            for v in t_base_camera
+        ],
+        "q_ee_to_board": [
+            float(v)
+            for v in q_ee_board
+        ],
+        "t_ee_to_board": [
+            float(v)
+            for v in t_ee_board
+        ],
+        "position_errors_m": [
+            float(v)
+            for v in pos_errors
+        ],
+        "rotation_errors_deg": [
+            float(v)
+            for v in rot_errors
+        ],
+    }
+
+    out_path = DATA_DIR / "eye_to_hand_quaternion_solution_debug.json"
+
+    with open(out_path, "w") as f:
+        json.dump(debug, f, indent=4)
+
+    print(f"\n[SAVED DEBUG JSON]")
+    print(out_path)
+
+
+# ============================================================
+# Main
+# ============================================================
 
 def main():
-    data = np.load(DATA_PATH)
+    (
+        robot_q,
+        robot_t,
+        camera_q,
+        camera_t,
+    ) = load_calibration_data()
 
-    T_base_to_ee_list = data["T_base_to_ee"]
-    T_camera_to_board_list = data["T_camera_to_board"]
+    print(f"[INFO] Loaded {len(robot_q)} samples")
 
-    n = len(T_base_to_ee_list)
-
-    print(f"[INFO] Loaded {n} samples")
-
-    if n < 8:
-        raise RuntimeError("Need at least 8 samples. Prefer 25–40 good samples.")
-
-    print(f"[INFO] ROT_WEIGHT = {ROT_WEIGHT}")
-    print(f"[INFO] Robust loss = {ROBUST_LOSS}, f_scale = {ROBUST_F_SCALE}")
-
-    T_base_to_camera, T_ee_to_board, result = solve_once(
-        T_base_to_ee_list,
-        T_camera_to_board_list,
+    (
+        T_base_to_camera,
+        T_ee_to_board,
+        q_base_camera,
+        t_base_camera,
+        q_ee_board,
+        t_ee_board,
+        result,
+    ) = solve_eye_to_hand(
+        robot_q,
+        robot_t,
+        camera_q,
+        camera_t,
     )
 
     print("\nT_base_to_camera:")
     print(T_base_to_camera)
 
+    print("\nq_base_to_camera [w, x, y, z]:")
+    print(q_base_camera)
+
+    print("\nt_base_to_camera [m]:")
+    print(t_base_camera)
+
     print("\nT_ee_to_board:")
     print(T_ee_to_board)
 
-    pos_errors, rot_errors = validate(
-        T_base_to_camera,
-        T_ee_to_board,
-        T_base_to_ee_list,
-        T_camera_to_board_list,
+    print("\nq_ee_to_board [w, x, y, z]:")
+    print(q_ee_board)
+
+    print("\nt_ee_to_board [m]:")
+    print(t_ee_board)
+
+    (
+        pos_errors,
+        rot_errors,
+    ) = validate_solution(
+        q_base_camera,
+        t_base_camera,
+        q_ee_board,
+        t_ee_board,
+        robot_q,
+        robot_t,
+        camera_q,
+        camera_t,
     )
 
-    t_ee_board = T_ee_to_board[:3, 3]
-    print("\nT_ee_to_board translation:")
-    print(f"x = {t_ee_board[0] * 1000:.2f} mm")
-    print(f"y = {t_ee_board[1] * 1000:.2f} mm")
-    print(f"z = {t_ee_board[2] * 1000:.2f} mm")
-    print(f"norm = {np.linalg.norm(t_ee_board) * 1000:.2f} mm")
+    np.save(
+        OUT_T_BASE_TO_CAMERA,
+        T_base_to_camera,
+    )
 
-    np.save(OUT_DIR / "T_base_to_camera.npy", T_base_to_camera)
-    np.save(OUT_DIR / "T_ee_to_board.npy", T_ee_to_board)
+    np.save(
+        OUT_T_EE_TO_BOARD,
+        T_ee_to_board,
+    )
 
-    np.savez(
-        OUT_DIR / "eye_to_hand_solution_debug.npz",
-        T_base_to_camera=T_base_to_camera,
-        T_ee_to_board=T_ee_to_board,
-        pos_errors=pos_errors,
-        rot_errors=rot_errors,
-        optimizer_x=result.x,
-        optimizer_cost=result.cost,
+    save_solution_debug(
+        q_base_camera,
+        t_base_camera,
+        q_ee_board,
+        t_ee_board,
+        pos_errors,
+        rot_errors,
     )
 
     print("\n[SAVED]")
-    print(OUT_DIR / "T_base_to_camera.npy")
-    print(OUT_DIR / "T_ee_to_board.npy")
-    print(OUT_DIR / "eye_to_hand_solution_debug.npz")
+    print(OUT_T_BASE_TO_CAMERA)
+    print(OUT_T_EE_TO_BOARD)
 
 
 if __name__ == "__main__":
