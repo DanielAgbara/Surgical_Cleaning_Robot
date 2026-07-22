@@ -61,12 +61,12 @@ import numpy as np
 ROOT = Path("/home/agbara-admin/Documents/Surgical_Cleaning_Robot")
 DATA_DIR = ROOT / "data" / "eye_to_hand"
 
-R_EE_BASE_FILE = DATA_DIR / "R_ee_base.json"
-T_EE_BASE_FILE = DATA_DIR / "t_ee_base.json"
-R_BASE_EE_FILE = DATA_DIR / "R_base_ee.json"
-T_BASE_EE_FILE = DATA_DIR / "t_base_ee.json"
-R_CAM_BOARD_FILE = DATA_DIR / "R_cam_board.json"
-T_CAM_BOARD_FILE = DATA_DIR / "t_cam_board.json"
+R_EE_BASE_FILE = DATA_DIR / "automatic_calibration" / "R_ee_base.json"
+T_EE_BASE_FILE = DATA_DIR / "automatic_calibration" /  "t_ee_base.json"
+R_BASE_EE_FILE = DATA_DIR / "automatic_calibration" / "R_base_ee.json"
+T_BASE_EE_FILE = DATA_DIR / "automatic_calibration" / "t_base_ee.json"
+R_CAM_BOARD_FILE = DATA_DIR / "automatic_calibration" / "R_cam_board.json"
+T_CAM_BOARD_FILE = DATA_DIR / "automatic_calibration" / "t_cam_board.json"
 
 REPORT_FILE = DATA_DIR / "opencv_direction_test.txt"
 

@@ -47,10 +47,10 @@ The robot is a 6 DOF serial manipulator with the following joint configuration:
 # --------------------------------------------------
 
 w1 = np.array([0, 0, -1])
-q1 = np.array([0.038, 0, 0.064])
+q1 = np.array([0.038, 0, 0.065])
 
 w2 = np.array([0, 1, 0])
-q2 = np.array([0.06874, 0, 0.117050])
+q2 = np.array([0.06874, 0, 0.105])
 
 w3 = np.array([0, 1, 0])
 q3 = np.array([0.097, 0, 0.228])
@@ -61,7 +61,7 @@ q4 = np.array([0.225, 0, 0.228])
 w5 = np.array([1, 0, 0])
 q5 = np.array([0.289, 0, 0.228])
 
-w6 = np.array([0, -1, 0])
+w6 = np.array([0, 1, 0])
 q6 = np.array([0.326, 0, 0.228])
 
 
@@ -115,18 +115,18 @@ JOINT_OFFSETS_DEG = np.array([
 # Robot command limits in degrees
 theta_min_robot_deg = np.array([
     -120.0,
+    -106.0,
+    -97.0,
     -95.0,
-    -90.0,
-    -90.0,
     -180.0,
-    10.0
+    0.0
 ])
 
 theta_max_robot_deg = np.array([
     120.0,
-    105.0,
+    106.0,
+    97.0,
     95.0,
-    90.0,
     180.0,
     100.0
 ])

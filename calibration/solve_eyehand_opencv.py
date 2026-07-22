@@ -112,12 +112,12 @@ ROOT = Path("/home/agbara-admin/Documents/Surgical_Cleaning_Robot")
 DATA_DIR = ROOT / "data" / "eye_to_hand"
 RESULTS_DIR = DATA_DIR / "opencv_results"
 
-R_EE_BASE_FILE = DATA_DIR / "R_ee_base.json"
-T_EE_BASE_FILE = DATA_DIR / "t_ee_base.json"
-R_BASE_EE_FILE = DATA_DIR / "R_base_ee.json"
-T_BASE_EE_FILE = DATA_DIR / "t_base_ee.json"
-R_CAM_BOARD_FILE = DATA_DIR / "R_cam_board.json"
-T_CAM_BOARD_FILE = DATA_DIR / "t_cam_board.json"
+R_EE_BASE_FILE = DATA_DIR / "automatic_calibration" / "R_ee_base.json"
+T_EE_BASE_FILE = DATA_DIR / "automatic_calibration" /  "t_ee_base.json"
+R_BASE_EE_FILE = DATA_DIR / "automatic_calibration" / "R_base_ee.json"
+T_BASE_EE_FILE = DATA_DIR / "automatic_calibration" / "t_base_ee.json"
+R_CAM_BOARD_FILE = DATA_DIR / "automatic_calibration" / "R_cam_board.json"
+T_CAM_BOARD_FILE = DATA_DIR / "automatic_calibration" / "t_cam_board.json"
 
 SUMMARY_FILE = RESULTS_DIR / "opencv_eye_to_hand_results.json"
 BEST_T_BASE_CAM_FILE = RESULTS_DIR / "T_base_camera_best.npy"
