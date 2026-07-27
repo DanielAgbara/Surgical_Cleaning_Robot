@@ -7,6 +7,8 @@ Script for all the functions for the camera:
 
 
 from pathlib import Path
+import json
+
 import cv2
 import numpy as np
 import pyzed.sl as sl
@@ -21,9 +23,10 @@ from detectron2.engine import DefaultPredictor
 # ZED Camera Functions
 # --------------------------------------------------
 
-ZED_RESOLUTION = sl.RESOLUTION.HD2K
+ZED_RESOLUTION = sl.RESOLUTION.HD720
 ZED_FPS = 15
 ZED_UNITS = sl.UNIT.METER
+ZED_DEPTH = sl.DEPTH_MODE.NEURAL_PLUS
 
 
 def open_zed():
@@ -50,7 +53,7 @@ def open_zed():
 
     # Depth must be enabled because the integration pipeline
     # will also retrieve depth and XYZ point-cloud information.
-    init_params.depth_mode = sl.DEPTH_MODE.NEURAL
+    init_params.depth_mode = ZED_DEPTH
     init_params.coordinate_units = ZED_UNITS
     init_params.coordinate_system = sl.COORDINATE_SYSTEM.IMAGE
 
@@ -60,7 +63,7 @@ def open_zed():
         raise RuntimeError(f"Could not open ZED camera: {status}")
 
     runtime_params = sl.RuntimeParameters()
-    runtime_params.confidence_threshold = 30
+    runtime_params.confidence_threshold = 50
     runtime_params.measure3D_reference_frame = sl.REFERENCE_FRAME.CAMERA
 
     # Reusable buffer for the left camera image.
@@ -256,3 +259,317 @@ def get_zed_left_intrinsics_rectified(zed):
 # --------------------------------------------------
 # Object Detection Functions
 # --------------------------------------------------
+INTEGRATION_DIR = Path(__file__).resolve().parent
+INTEGRATION_DATA_DIR = INTEGRATION_DIR / "data"
+TRAY_MODEL_DIR = (
+    INTEGRATION_DATA_DIR
+    / "models"
+    / "maskrcnn_tray"
+)
+TRAY_CONFIG_PATH = TRAY_MODEL_DIR / "config.yaml"
+TRAY_MODEL_PATH = TRAY_MODEL_DIR / "model_final.pth"
+
+TRAY_DATA_DIR = INTEGRATION_DATA_DIR / "tray_data"
+TRAY_PLANE_FILE = TRAY_DATA_DIR / "tray_plane.json"
+TRAY_CENTROID_FILE = TRAY_DATA_DIR / "tray_centroid.json"
+
+TRAY_SCORE_THRESHOLD = 0.95
+TRAY_MIN_DEPTH_M = 0.10
+TRAY_MAX_DEPTH_M = 3.00
+TRAY_PLANE_DISTANCE_THRESHOLD_M = 0.015
+TRAY_MIN_3D_POINTS = 100
+TRAY_MAX_RANSAC_POINTS = 60000
+
+
+def build_tray_predictor(
+    score_threshold=TRAY_SCORE_THRESHOLD,
+    device=None,
+):
+    """Load the fine-tuned one-class Mask R-CNN tray model."""
+    if not TRAY_CONFIG_PATH.is_file():
+        raise FileNotFoundError(
+            f"Tray model configuration not found: {TRAY_CONFIG_PATH}"
+        )
+    if not TRAY_MODEL_PATH.is_file():
+        raise FileNotFoundError(
+            f"Tray model weights not found: {TRAY_MODEL_PATH}"
+        )
+    if not 0.0 <= score_threshold <= 1.0:
+        raise ValueError("score_threshold must be between 0 and 1.")
+
+    config = get_cfg()
+    config.merge_from_file(str(TRAY_CONFIG_PATH))
+    config.MODEL.WEIGHTS = str(TRAY_MODEL_PATH)
+    config.MODEL.ROI_HEADS.SCORE_THRESH_TEST = float(score_threshold)
+    config.MODEL.DEVICE = (
+        device
+        if device is not None
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+
+    print(f"[INFO] Loading tray detector on {config.MODEL.DEVICE}")
+    return DefaultPredictor(config)
+
+
+def detect_tray(image_bgr, predictor, mask_kernel_size=5):
+    """Return the highest-confidence tray mask and its score.
+
+    Returns ``None`` when no tray is detected. The trained model contains one
+    class, so every returned instance is a tray candidate.
+    """
+    if image_bgr is None or not isinstance(image_bgr, np.ndarray):
+        raise ValueError("image_bgr must be a NumPy image.")
+    if image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+        raise ValueError("image_bgr must have shape (height, width, 3).")
+    if mask_kernel_size < 1:
+        raise ValueError("mask_kernel_size must be positive.")
+
+    outputs = predictor(image_bgr)
+    if "instances" not in outputs:
+        return None
+
+    instances = outputs["instances"].to("cpu")
+    if len(instances) == 0 or not instances.has("pred_masks"):
+        return None
+
+    scores = instances.scores.numpy()
+    masks = instances.pred_masks.numpy()
+    best_index = int(np.argmax(scores))
+    mask = masks[best_index].astype(np.uint8) * 255
+
+    # Remove isolated pixels and fill small gaps in the segmentation.
+    kernel = np.ones(
+        (mask_kernel_size, mask_kernel_size),
+        dtype=np.uint8,
+    )
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = mask > 0
+
+    if mask.shape != image_bgr.shape[:2] or not np.any(mask):
+        return None
+
+    return {
+        "mask": mask,
+        "score": float(scores[best_index]),
+    }
+
+
+def get_tray_points(
+    xyz,
+    tray_mask,
+    valid_mask=None,
+    min_depth_m=TRAY_MIN_DEPTH_M,
+    max_depth_m=TRAY_MAX_DEPTH_M,
+):
+    """Extract finite ZED points inside the tray mask."""
+    xyz = np.asarray(xyz)
+    tray_mask = np.asarray(tray_mask, dtype=bool)
+
+    if xyz.ndim != 3 or xyz.shape[2] != 3:
+        raise ValueError("xyz must have shape (height, width, 3).")
+    if tray_mask.shape != xyz.shape[:2]:
+        raise ValueError("tray_mask and xyz must have matching image sizes.")
+    if not 0 <= min_depth_m < max_depth_m:
+        raise ValueError("Depth limits are invalid.")
+
+    usable = np.isfinite(xyz).all(axis=2)
+    usable &= xyz[:, :, 2] > min_depth_m
+    usable &= xyz[:, :, 2] < max_depth_m
+
+    if valid_mask is not None:
+        valid_mask = np.asarray(valid_mask, dtype=bool)
+        if valid_mask.shape != tray_mask.shape:
+            raise ValueError("valid_mask and tray_mask must have matching sizes.")
+        usable &= valid_mask
+
+    return np.asarray(xyz[tray_mask & usable], dtype=np.float64)
+
+
+def calculate_tray_plane(
+    xyz,
+    tray_mask,
+    valid_mask=None,
+    distance_threshold_m=TRAY_PLANE_DISTANCE_THRESHOLD_M,
+    ransac_iterations=1000,
+):
+    """Fit the largest RANSAC plane inside the detected tray mask."""
+    if distance_threshold_m <= 0:
+        raise ValueError("distance_threshold_m must be positive.")
+    if ransac_iterations < 1:
+        raise ValueError("ransac_iterations must be positive.")
+
+    tray_points = get_tray_points(xyz, tray_mask, valid_mask)
+    if len(tray_points) < TRAY_MIN_3D_POINTS:
+        return None
+
+    # Bound RANSAC cost without changing the mask used for the centroid.
+    fit_points = tray_points
+    if len(fit_points) > TRAY_MAX_RANSAC_POINTS:
+        indices = np.linspace(
+            0,
+            len(fit_points) - 1,
+            TRAY_MAX_RANSAC_POINTS,
+            dtype=int,
+        )
+        fit_points = fit_points[indices]
+
+    cloud = o3d.geometry.PointCloud()
+    cloud.points = o3d.utility.Vector3dVector(fit_points)
+    coefficients, inliers = cloud.segment_plane(
+        distance_threshold=float(distance_threshold_m),
+        ransac_n=3,
+        num_iterations=int(ransac_iterations),
+    )
+
+    coefficients = np.asarray(coefficients, dtype=np.float64)
+    normal_length = np.linalg.norm(coefficients[:3])
+    if normal_length <= np.finfo(float).eps:
+        return None
+    coefficients /= normal_length
+
+    # Keep the normal direction consistent: it points from the tray to camera.
+    fitted_centroid = np.mean(fit_points[np.asarray(inliers, dtype=int)], axis=0)
+    if np.dot(coefficients[:3], fitted_centroid) > 0:
+        coefficients *= -1.0
+
+    return {
+        "coefficients": coefficients,
+        "normal": coefficients[:3].copy(),
+        "number_of_mask_points": int(len(tray_points)),
+        "number_of_ransac_points": int(len(fit_points)),
+        "number_of_inliers": int(len(inliers)),
+        "distance_threshold_m": float(distance_threshold_m),
+    }
+
+
+def calculate_tray_centroid(
+    tray_mask,
+    camera_matrix,
+    plane,
+):
+    """Intersect the 2D mask-centroid ray with the fitted tray plane."""
+    if plane is None:
+        return None
+
+    mask = np.asarray(tray_mask, dtype=np.uint8)
+    moments = cv2.moments(mask)
+    if moments["m00"] <= 0:
+        return None
+
+    pixel = np.array(
+        [
+            moments["m10"] / moments["m00"],
+            moments["m01"] / moments["m00"],
+            1.0,
+        ],
+        dtype=np.float64,
+    )
+    camera_matrix = np.asarray(
+        camera_matrix,
+        dtype=np.float64,
+    ).reshape(3, 3)
+    ray = np.linalg.solve(camera_matrix, pixel)
+
+    coefficients = np.asarray(
+        plane["coefficients"],
+        dtype=np.float64,
+    ).reshape(4)
+    denominator = float(coefficients[:3] @ ray)
+    if abs(denominator) <= 1e-8:
+        return None
+
+    distance_along_ray = -coefficients[3] / denominator
+    if not np.isfinite(distance_along_ray) or distance_along_ray <= 0:
+        return None
+
+    return distance_along_ray * ray
+
+
+def process_tray(
+    image_bgr,
+    xyz,
+    camera_matrix,
+    predictor,
+    valid_mask=None,
+):
+    """Detect a tray and calculate its plane and 3D centroid."""
+    detection = detect_tray(image_bgr, predictor)
+    if detection is None:
+        return None
+
+    plane = calculate_tray_plane(
+        xyz,
+        detection["mask"],
+        valid_mask,
+    )
+    if plane is None:
+        return {
+            "detection": detection,
+            "plane": None,
+            "centroid": None,
+        }
+
+    centroid = calculate_tray_centroid(
+        detection["mask"],
+        camera_matrix,
+        plane,
+    )
+    return {
+        "detection": detection,
+        "plane": plane,
+        "centroid": centroid,
+    }
+
+
+def _write_json(path, value):
+    """Write JSON atomically."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with open(temporary, "w", encoding="utf-8") as file:
+        json.dump(value, file, indent=2)
+        file.write("\n")
+    temporary.replace(path)
+
+
+def save_tray_data(
+    plane,
+    centroid,
+    plane_path=TRAY_PLANE_FILE,
+    centroid_path=TRAY_CENTROID_FILE,
+):
+    """Save the tray plane and centroid as two camera-frame JSON files."""
+    if plane is None or centroid is None:
+        raise ValueError("A valid tray plane and centroid are required.")
+
+    coefficients = np.asarray(plane["coefficients"], dtype=float).reshape(4)
+    centroid = np.asarray(centroid, dtype=float).reshape(3)
+    if not np.all(np.isfinite(coefficients)) or not np.all(np.isfinite(centroid)):
+        raise ValueError("Tray plane and centroid must contain finite values.")
+
+    plane_data = {
+        "coordinate_frame": "zed_left_camera",
+        "units": "meters",
+        "equation": "a*x + b*y + c*z + d = 0",
+        "a": float(coefficients[0]),
+        "b": float(coefficients[1]),
+        "c": float(coefficients[2]),
+        "d": float(coefficients[3]),
+        "normal": coefficients[:3].tolist(),
+        "number_of_inliers": int(plane["number_of_inliers"]),
+        "number_of_ransac_points": int(plane["number_of_ransac_points"]),
+    }
+    centroid_data = {
+        "coordinate_frame": "zed_left_camera",
+        "units": "meters",
+        "x": float(centroid[0]),
+        "y": float(centroid[1]),
+        "z": float(centroid[2]),
+    }
+
+    _write_json(plane_path, plane_data)
+    _write_json(centroid_path, centroid_data)
+    print(f"[INFO] Tray plane saved to {Path(plane_path).resolve()}")
+    print(f"[INFO] Tray centroid saved to {Path(centroid_path).resolve()}")
+    return Path(plane_path).resolve(), Path(centroid_path).resolve()

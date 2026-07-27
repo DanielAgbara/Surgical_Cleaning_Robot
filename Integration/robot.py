@@ -91,6 +91,34 @@ def rpy_to_R(rpy: np.ndarray) -> np.ndarray:
     return Rz(y) @ Ry(p) @ Rx(r)
 
 
+def rpy_xyz_to_T(
+    roll,
+    pitch,
+    yaw,
+    x,
+    y,
+    z,
+    degrees=False,
+):
+    """Create a transform with R = Rz(yaw) Ry(pitch) Rx(roll).
+
+    Translation units are preserved. Set ``degrees=True`` when the input
+    angles come from the Lite 6 API.
+    """
+    rpy = np.array([roll, pitch, yaw], dtype=float)
+    position = np.array([x, y, z], dtype=float)
+
+    if not np.all(np.isfinite(rpy)) or not np.all(np.isfinite(position)):
+        raise ValueError("RPY angles and XYZ position must be finite.")
+    if degrees:
+        rpy = np.radians(rpy)
+
+    T = np.eye(4, dtype=float)
+    T[:3, :3] = rpy_to_R(rpy)
+    T[:3, 3] = position
+    return T
+
+
 def RToAxisAngle(R: np.ndarray, eps: float = 1e-6) -> tuple[np.ndarray, float]:
     """
     Computes:
@@ -1780,6 +1808,141 @@ class SOArm101:
             norm_w_hist,
             norm_v_hist,
         )
-    
 
 
+class Lite6:
+    """Small UFACTORY Lite 6 adapter used by the integration pipeline."""
+
+    # UFACTORY Studio's documented Lite 6 "Initial Position" in degrees.
+    INITIAL_JOINT_ANGLES_DEG = (0.0, 9.9, 31.8, 0.0, 21.9, 0.0)
+
+    def __init__(self, ip_address):
+        self.ip_address = str(ip_address)
+        self.arm = None
+
+    @staticmethod
+    def T_mm_to_meters(T_mm):
+        """Return a copy of a transform with translation converted to metres."""
+        T_m = np.asarray(T_mm, dtype=float).reshape(4, 4).copy()
+        if not np.all(np.isfinite(T_m)):
+            raise ValueError("Transform must contain finite values.")
+
+        T_m[:3, 3] /= 1000.0
+        return T_m
+
+    @staticmethod
+    def pose_mm_deg_to_T_m(pose):
+        """Convert Lite 6 [x, y, z, roll, pitch, yaw] to a metric transform."""
+        pose = np.asarray(pose, dtype=float).reshape(6)
+        x, y, z, roll, pitch, yaw = pose
+
+        T_mm = rpy_xyz_to_T(
+            roll,
+            pitch,
+            yaw,
+            x,
+            y,
+            z,
+            degrees=True,
+        )
+        return Lite6.T_mm_to_meters(T_mm)
+
+    def connect(self):
+        """Connect and prepare the Lite 6 for position commands."""
+        if self.arm is not None:
+            return
+
+        try:
+            from xarm.wrapper import XArmAPI
+        except ImportError as error:
+            raise RuntimeError(
+                "Install the Lite 6 SDK with: pip install xarm-python-sdk"
+            ) from error
+
+        self.arm = XArmAPI(
+            self.ip_address,
+            is_radian=False,
+            do_not_open=True,
+        )
+        self.arm.connect()
+
+        try:
+            self.reset_state()
+        except Exception:
+            self.disconnect()
+            raise
+
+    def reset_state(self):
+        """Clear controller faults and restore ready Cartesian position mode."""
+        if self.arm is None:
+            raise RuntimeError("Lite 6 is not connected.")
+
+        for operation, command in (
+            ("clean errors", self.arm.clean_error),
+            ("clean warnings", self.arm.clean_warn),
+            (
+                "enable motion",
+                lambda: self.arm.motion_enable(enable=True),
+            ),
+            ("set position mode", lambda: self.arm.set_mode(0)),
+            ("set ready state", lambda: self.arm.set_state(0)),
+        ):
+            code = command()
+            if code != 0:
+                raise RuntimeError(
+                    f"Could not {operation}; Lite 6 error code: {code}"
+                )
+
+    def move_to_initial(self, speed_deg_s=20.0, acceleration_deg_s2=200.0):
+        """Reset the controller and move to the documented initial joint pose."""
+        if speed_deg_s <= 0:
+            raise ValueError("speed_deg_s must be positive.")
+        if acceleration_deg_s2 <= 0:
+            raise ValueError("acceleration_deg_s2 must be positive.")
+
+        self.reset_state()
+        code = self.arm.set_servo_angle(
+            angle=list(self.INITIAL_JOINT_ANGLES_DEG),
+            speed=float(speed_deg_s),
+            mvacc=float(acceleration_deg_s2),
+            wait=True,
+            is_radian=False,
+        )
+        if code != 0:
+            raise RuntimeError(
+                "Could not move the Lite 6 to its initial position; "
+                f"error code: {code}"
+            )
+
+    def enter_manual_mode(self):
+        """Enter Mode 2 free-drive after restoring a known controller state."""
+        self.reset_state()
+        code = self.arm.set_mode(2)
+        if code != 0:
+            raise RuntimeError(
+                f"Could not enable Lite 6 manual mode; error code: {code}"
+            )
+        code = self.arm.set_state(0)
+        if code != 0:
+            raise RuntimeError(
+                f"Could not ready Lite 6 manual mode; error code: {code}"
+            )
+
+    def disconnect(self):
+        """Disconnect from the Lite 6 controller."""
+        if self.arm is not None:
+            self.arm.disconnect()
+            self.arm = None
+
+    def get_T_base_to_ee(self):
+        """Read the current TCP pose as a 4x4 transform in metres."""
+        if self.arm is None:
+            raise RuntimeError("Lite 6 is not connected.")
+
+        code, pose = self.arm.get_position(is_radian=False)
+        if code != 0:
+            raise RuntimeError(
+                f"Could not read Lite 6 TCP pose; error code: {code}"
+            )
+
+        return self.pose_mm_deg_to_T_m(pose)

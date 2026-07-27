@@ -13,6 +13,7 @@ This script contains the complete calibration workflow:
 # ============================================================
 
 import argparse
+import curses
 import json
 import time
 
@@ -546,9 +547,12 @@ def generateCharucoPDF():
         board_image = board.draw(image_size, marginSize=0, borderBits=1)
 
     size_label = f"{width_mm:g}x{height_mm:g}mm"
-    pdf_path = Path(
-        f"charuco_{config.squares_x}x{config.squares_y}_{size_label}.pdf"
-    ).resolve()
+    board_directory = Path(__file__).resolve().parent / "data" / "charuco_boards"
+    board_directory.mkdir(parents=True, exist_ok=True)
+    pdf_path = (
+        board_directory
+        / f"charuco_{config.squares_x}x{config.squares_y}_{size_label}.pdf"
+    )
     Image.fromarray(board_image).convert("L").save(
         pdf_path, "PDF", resolution=dpi
     )
@@ -562,14 +566,17 @@ def generateCharucoPDF():
 # Trajectory files and shared calibration paths
 # ======================================================
 
-ROOT = Path(__file__).resolve().parents[1]
-EYE_HAND_DIR = ROOT / "data" / "eye_to_hand"
+INTEGRATION_DIR = Path(__file__).resolve().parent
+INTEGRATION_DATA_DIR = INTEGRATION_DIR / "data"
+EYE_HAND_DIR = INTEGRATION_DATA_DIR / "eyehand"
 TRAJECTORY_FILE = EYE_HAND_DIR / "calibration_trajectory.json"
+LITE6_TRAJECTORY_FILE = EYE_HAND_DIR / "lite6_calibration_trajectory.json"
 R_BASE_EE_FILE = EYE_HAND_DIR / "R_base_ee.json"
 T_BASE_EE_FILE = EYE_HAND_DIR / "t_base_ee.json"
 R_CAM_BOARD_FILE = EYE_HAND_DIR / "R_cam_board.json"
 T_CAM_BOARD_FILE = EYE_HAND_DIR / "t_cam_board.json"
 SOLUTION_FILE = EYE_HAND_DIR / "eye_hand_calibration.json"
+TSAI_SOLUTION_FILE = EYE_HAND_DIR / "eye_hand_calibration_tsai.json"
 COLLECTION_WINDOW_NAME = "Collect eye-hand calibration"
 
 JOINT_NAMES = (
@@ -580,6 +587,7 @@ JOINT_NAMES = (
     "wrist_roll.pos",
     "gripper.pos",
 )
+LITE6_POSE_NAMES = ("x", "y", "z", "roll", "pitch", "yaw")
 
 # OpenCV arrow-key codes vary with the active GUI backend.
 LEFT_ARROW_KEYS = {81, 2424832, 65361}
@@ -645,6 +653,89 @@ def load_trajectory_file(path=TRAJECTORY_FILE):
     path = Path(path).resolve()
     with open(path, "r", encoding="utf-8") as file:
         return validate_trajectory(json.load(file))
+
+
+def validate_lite6_trajectory(points):
+    """Validate absolute Lite 6 TCP poses in millimetres and degrees."""
+    if not isinstance(points, list) or not points:
+        raise ValueError("Trajectory must be a non-empty JSON list.")
+
+    clean_points = []
+    for point_index, point in enumerate(points):
+        if not isinstance(point, dict) or set(point) != set(LITE6_POSE_NAMES):
+            raise ValueError(
+                f"Point {point_index} must contain exactly: {LITE6_POSE_NAMES}"
+            )
+        values = np.asarray(
+            [point[name] for name in LITE6_POSE_NAMES], dtype=float
+        )
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"Point {point_index} contains a non-finite value.")
+        clean_points.append(
+            {
+                name: float(values[index])
+                for index, name in enumerate(LITE6_POSE_NAMES)
+            }
+        )
+    return clean_points
+
+
+def save_lite6_trajectory_file(points, path=LITE6_TRAJECTORY_FILE):
+    """Save an ordered list of absolute Lite 6 TCP poses."""
+    path = Path(path).resolve()
+    if path.suffix.lower() != ".json":
+        raise ValueError("Trajectory path must end in .json.")
+    points = validate_lite6_trajectory(points)
+    write_json(path, points)
+    print(f"[INFO] Saved {len(points)} Lite 6 poses to {path}")
+    return path
+
+
+def load_lite6_trajectory_file(path=LITE6_TRAJECTORY_FILE):
+    """Load and validate an absolute Lite 6 TCP trajectory."""
+    path = Path(path).resolve()
+    with open(path, "r", encoding="utf-8") as file:
+        return validate_lite6_trajectory(json.load(file))
+
+
+def interpolate_lite6_trajectory(points, points_between=0):
+    """Insert evenly spaced TCP poses between each captured Lite 6 pose.
+
+    XYZ is interpolated linearly in millimetres. Euler angles use the shortest
+    signed angular difference in degrees, avoiding unnecessary 360-degree
+    rotations across the wrap boundary.
+    """
+    points = validate_lite6_trajectory(points)
+    if (
+        isinstance(points_between, bool)
+        or not isinstance(points_between, (int, np.integer))
+        or points_between < 0
+    ):
+        raise ValueError("points_between must be a non-negative integer.")
+    if points_between == 0 or len(points) == 1:
+        return points
+
+    values = np.asarray(
+        [[point[name] for name in LITE6_POSE_NAMES] for point in points],
+        dtype=float,
+    )
+    interpolated = []
+    for start, end in zip(values[:-1], values[1:]):
+        interpolated.append(start)
+        delta = end - start
+        delta[3:] = (delta[3:] + 180.0) % 360.0 - 180.0
+        for step in range(1, points_between + 1):
+            fraction = step / (points_between + 1)
+            interpolated.append(start + fraction * delta)
+    interpolated.append(values[-1])
+
+    return [
+        {
+            name: float(pose[index])
+            for index, name in enumerate(LITE6_POSE_NAMES)
+        }
+        for pose in interpolated
+    ]
 
 
 def delete_trajectory_file(path=TRAJECTORY_FILE):
@@ -716,6 +807,16 @@ def close_image_windows():
         pass
 
 
+def return_robot_to_rest(robot_arm):
+    """Attempt a rest move during cleanup without hiding prior errors."""
+    try:
+        print("[INFO] Returning robot to the rest position...")
+        robot_arm.move_to_rest(max_step_deg=2.0, step_delay=0.05)
+        print("[INFO] Robot reached the rest position.")
+    except Exception as error:
+        print(f"[WARNING] Robot could not return to rest: {error}")
+
+
 def invert_transform(T):
     """Return the rigid inverse of a 4x4 transform."""
     T = np.asarray(T, dtype=float).reshape(4, 4)
@@ -737,6 +838,291 @@ def make_transform(rotation, translation):
 # Interactive trajectory creation
 # ======================================================
 
+def control_lite6_with_keyboard(
+    ip_address,
+    translation_step_mm=5.0,
+    rotation_step_deg=2.0,
+    speed_mm_s=30.0,
+    trajectory_path=None,
+    control_mode="keyboard",
+    points_between=0,
+):
+    """Jog a UFACTORY Lite 6 from the terminal, one step per keypress.
+
+    Translation keys are W/S (X), A/D (Y), and R/F (Z). Rotation keys are
+    I/K (roll), J/L (pitch), and U/O (yaw). When ``trajectory_path`` is
+    supplied, C captures the current pose and Backspace removes the last one.
+    """
+    if translation_step_mm <= 0:
+        raise ValueError("translation_step_mm must be positive.")
+    if rotation_step_deg <= 0:
+        raise ValueError("rotation_step_deg must be positive.")
+    if speed_mm_s <= 0:
+        raise ValueError("speed_mm_s must be positive.")
+    control_mode = str(control_mode).strip().lower()
+    if control_mode not in ("keyboard", "manual"):
+        raise ValueError("control_mode must be 'keyboard' or 'manual'.")
+    if points_between < 0:
+        raise ValueError("points_between cannot be negative.")
+
+    lite6 = robot.Lite6(ip_address)
+    points = []
+    zed = None
+    runtime = None
+    image_zed = None
+    camera_matrix = None
+    dist_coeffs = None
+    board = None
+    detector = None
+    preview_window = "Lite 6 trajectory board preview"
+
+    jogs = {
+        ord("w"): ("x", translation_step_mm),
+        ord("s"): ("x", -translation_step_mm),
+        ord("a"): ("y", translation_step_mm),
+        ord("d"): ("y", -translation_step_mm),
+        ord("r"): ("z", translation_step_mm),
+        ord("f"): ("z", -translation_step_mm),
+        ord("i"): ("roll", rotation_step_deg),
+        ord("k"): ("roll", -rotation_step_deg),
+        ord("j"): ("pitch", rotation_step_deg),
+        ord("l"): ("pitch", -rotation_step_deg),
+        ord("u"): ("yaw", rotation_step_deg),
+        ord("o"): ("yaw", -rotation_step_deg),
+    }
+
+    def keyboard_loop(screen):
+        curses.curs_set(0)
+        screen.keypad(True)
+        screen.timeout(20)
+        status = "Ready"
+        board_status = "Camera preview disabled"
+
+        while True:
+            preview_key = -1
+            if zed is not None:
+                image = get_image(zed, runtime, image_zed)
+                if image is not None:
+                    detection = detect_charuco_board(image, board, detector)
+                    pose = estimate_charuco_pose(
+                        detection,
+                        board,
+                        camera_matrix,
+                        dist_coeffs,
+                    )
+                    board_status = (
+                        f"markers={detection.num_markers}/{len(board.getIds())}, "
+                        f"corners={detection.num_charuco_corners}/"
+                        f"{DEFAULT_CHARUCO_CONFIG.max_charuco_corners}, "
+                        f"pose={'yes' if pose is not None else 'no'}"
+                    )
+                    preview_key = show_image(
+                        preview_window,
+                        image,
+                        (
+                            "Lite 6 trajectory creation",
+                            board_status,
+                            "C capture | Backspace undo | Q save | ESC cancel",
+                        ),
+                        detection,
+                        pose,
+                        camera_matrix,
+                        dist_coeffs,
+                        wait_ms=1,
+                    )
+
+            screen.erase()
+            title = (
+                "Lite 6 free-drive trajectory capture"
+                if control_mode == "manual"
+                else "Lite 6 keyboard control"
+            )
+            screen.addstr(0, 0, title, curses.A_BOLD)
+            if control_mode == "manual":
+                screen.addstr(2, 0, "Move the robot by hand (Mode 2 free-drive)")
+                screen.addstr(3, 0, "Confirm mounting and payload are configured")
+            else:
+                screen.addstr(2, 0, "W/S: +X/-X     A/D: +Y/-Y")
+                screen.addstr(3, 0, "R/F: +Z/-Z")
+                screen.addstr(4, 0, "I/K: +roll/-roll")
+                screen.addstr(5, 0, "J/L: +pitch/-pitch")
+                screen.addstr(6, 0, "U/O: +yaw/-yaw")
+            if trajectory_path is None:
+                screen.addstr(8, 0, "Q: disconnect and quit")
+            else:
+                screen.addstr(
+                    8,
+                    0,
+                    "C: capture  Backspace: undo  Q: save  ESC: cancel",
+                )
+            if control_mode == "manual":
+                screen.addstr(
+                    10,
+                    0,
+                    f"Interpolation: {points_between} pose(s) per segment",
+                )
+            else:
+                screen.addstr(
+                    10,
+                    0,
+                    f"Steps: {translation_step_mm:g} mm, "
+                    f"{rotation_step_deg:g} deg; speed {speed_mm_s:g} mm/s",
+                )
+
+            code, pose = lite6.arm.get_position(is_radian=False)
+            if code == 0:
+                screen.addstr(
+                    12,
+                    0,
+                    "Pose [x y z r p y]: "
+                    + " ".join(f"{value:8.2f}" for value in pose[:6]),
+                )
+            else:
+                status = f"Pose read failed with Lite 6 code {code}"
+
+            screen.addstr(14, 0, f"Status: {status}")
+            if trajectory_path is not None:
+                screen.addstr(15, 0, f"Captured poses: {len(points)}")
+                screen.addstr(16, 0, f"Board: {board_status}")
+            screen.refresh()
+
+            key = preview_key if preview_key != -1 else screen.getch()
+            if key == -1:
+                continue
+            if key == 27:
+                return None
+            key = ord(chr(key).lower()) if 0 <= key <= 255 else key
+            if key == ord("q"):
+                if trajectory_path is not None:
+                    if not points:
+                        status = "Capture at least one pose before saving"
+                        continue
+                    saved_points = interpolate_lite6_trajectory(
+                        points, points_between
+                    )
+                    return save_lite6_trajectory_file(
+                        saved_points, trajectory_path
+                    )
+                return None
+            if trajectory_path is not None and key == ord("c"):
+                code, pose = lite6.arm.get_position(is_radian=False)
+                if code != 0:
+                    raise RuntimeError(
+                        f"Could not capture Lite 6 pose; error code {code}"
+                    )
+                points.append(
+                    {
+                        name: float(pose[index])
+                        for index, name in enumerate(LITE6_POSE_NAMES)
+                    }
+                )
+                status = f"Captured pose {len(points)}"
+                continue
+            if trajectory_path is not None and key in (
+                curses.KEY_BACKSPACE,
+                8,
+                127,
+            ):
+                if points:
+                    points.pop()
+                    status = "Removed the last pose"
+                else:
+                    status = "No captured poses to remove"
+                continue
+            if key not in jogs:
+                status = "Unknown key"
+                continue
+            if control_mode == "manual":
+                status = "Manual mode: drag the robot by hand; C captures"
+                continue
+
+            axis, amount = jogs[key]
+            command = {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "roll": 0.0,
+                "pitch": 0.0,
+                "yaw": 0.0,
+            }
+            command[axis] = amount
+            code = lite6.arm.set_position(
+                **command,
+                speed=speed_mm_s,
+                wait=True,
+                relative=True,
+                is_radian=False,
+            )
+            if code != 0:
+                raise RuntimeError(
+                    f"Lite 6 {axis} jog failed with error code {code}"
+                )
+            status = f"Moved {axis} by {amount:+g}"
+
+    initial_position_reached = False
+    try:
+        lite6.connect()
+        print("[INFO] Moving Lite 6 to its initial position...")
+        lite6.move_to_initial()
+        initial_position_reached = True
+        if trajectory_path is not None:
+            zed, runtime, image_zed = open_zed()
+            camera_matrix, dist_coeffs = get_zed_left_intrinsics_rectified(zed)
+            board, detector = create_charuco_detector(
+                DEFAULT_CHARUCO_CONFIG,
+                camera_matrix,
+                dist_coeffs,
+            )
+            cv2.namedWindow(preview_window, cv2.WINDOW_NORMAL)
+        if control_mode == "manual":
+            print(
+                "[WARNING] Entering Mode 2 free-drive. The configured mounting "
+                "direction and payload must match the physical robot."
+            )
+            lite6.enter_manual_mode()
+        return curses.wrapper(keyboard_loop)
+    finally:
+        close_image_windows()
+        if zed is not None:
+            zed.close()
+        if lite6.arm is not None:
+            try:
+                if initial_position_reached:
+                    print("[INFO] Returning Lite 6 to its initial position...")
+                    lite6.move_to_initial()
+                    print("[INFO] Lite 6 reached its initial position.")
+                else:
+                    lite6.reset_state()
+            except Exception as error:
+                print(
+                    "[WARNING] Could not return the Lite 6 to its initial "
+                    "position "
+                    f"during cleanup: {error}"
+                )
+        lite6.disconnect()
+
+
+def create_lite6_trajectory_with_keyboard(
+    ip_address,
+    path=LITE6_TRAJECTORY_FILE,
+    translation_step_mm=5.0,
+    rotation_step_deg=2.0,
+    speed_mm_s=30.0,
+    control_mode="keyboard",
+    points_between=0,
+):
+    """Capture Lite 6 TCP poses using keyboard jogging or manual free-drive."""
+    return control_lite6_with_keyboard(
+        ip_address,
+        translation_step_mm,
+        rotation_step_deg,
+        speed_mm_s,
+        trajectory_path=path,
+        control_mode=control_mode,
+        points_between=points_between,
+    )
+
+
 def create_trajectory_with_keyboard(
     path=TRAJECTORY_FILE,
     port="/dev/ttyACM0",
@@ -754,6 +1140,7 @@ def create_trajectory_with_keyboard(
     arm = robot.SOArm101(port=port, id=robot_id)
     zed = None
     connected = False
+    motion_ready = False
     points = []
     selected_joint = 0
     window = "Create calibration trajectory"
@@ -766,6 +1153,7 @@ def create_trajectory_with_keyboard(
             name: float(current[index])
             for index, name in enumerate(JOINT_NAMES)
         }
+        motion_ready = True
 
         zed, runtime, image_zed = open_zed()
         camera_matrix, dist_coeffs = get_zed_left_intrinsics_rectified(zed)
@@ -820,6 +1208,12 @@ def create_trajectory_with_keyboard(
                 points.pop()
                 print("[INFO] Removed the last trajectory point")
             elif key in (ord("q"), ord("Q")):
+                if not points:
+                    print(
+                        "[INFO] No trajectory points were saved; "
+                        "no trajectory file was created."
+                    )
+                    return None
                 return save_trajectory_file(points, path)
             elif key == 27:
                 print("[INFO] Trajectory creation cancelled")
@@ -828,6 +1222,8 @@ def create_trajectory_with_keyboard(
         close_image_windows()
         if zed is not None:
             zed.close()
+        if connected and motion_ready:
+            return_robot_to_rest(arm)
         if connected:
             arm.disconnect()
 
@@ -914,6 +1310,7 @@ def collect_calibration_data(
     arm = robot.SOArm101(port=port, id=robot_id)
     zed = None
     connected = False
+    motion_ready = False
     T_base_ee_list = []
     T_cam_board_list = []
 
@@ -936,6 +1333,7 @@ def collect_calibration_data(
             name: float(current[index])
             for index, name in enumerate(JOINT_NAMES)
         }
+        motion_ready = True
 
         zed, runtime, image_zed = open_zed()
         camera_matrix, dist_coeffs = get_zed_left_intrinsics_rectified(zed)
@@ -979,12 +1377,93 @@ def collect_calibration_data(
         close_image_windows()
         if zed is not None:
             zed.close()
+        if connected and motion_ready:
+            return_robot_to_rest(arm)
         if connected:
             arm.disconnect()
 
 
+def collect_lite6_calibration_data(
+    ip_address,
+    trajectory_path=LITE6_TRAJECTORY_FILE,
+    settle_seconds=3.0,
+    speed_mm_s=30.0,
+):
+    """Replay a Lite 6 TCP trajectory and collect synchronized calibration data."""
+    if settle_seconds < 0:
+        raise ValueError("settle_seconds cannot be negative.")
+    if speed_mm_s <= 0:
+        raise ValueError("speed_mm_s must be positive.")
+
+    trajectory = load_lite6_trajectory_file(trajectory_path)
+    lite6 = robot.Lite6(ip_address)
+    zed = None
+    T_base_ee_list = []
+    T_cam_board_list = []
+
+    confirmation = input(
+        f"This will move the Lite 6 through {len(trajectory)} absolute TCP "
+        "poses and overwrite old R/t data. Type RUN to continue: "
+    ).strip()
+    if confirmation != "RUN":
+        print("[INFO] Collection cancelled")
+        return None
+
+    save_collected_rt([], [])
+
+    try:
+        lite6.connect()
+        zed, runtime, image_zed = open_zed()
+        camera_matrix, dist_coeffs = get_zed_left_intrinsics_rectified(zed)
+        board, detector = create_charuco_detector(
+            DEFAULT_CHARUCO_CONFIG, camera_matrix, dist_coeffs
+        )
+        cv2.namedWindow(COLLECTION_WINDOW_NAME, cv2.WINDOW_NORMAL)
+
+        for index, target in enumerate(trajectory):
+            print(f"[INFO] Lite 6 pose {index + 1}/{len(trajectory)}")
+            code = lite6.arm.set_position(
+                **target,
+                speed=speed_mm_s,
+                wait=True,
+                is_radian=False,
+            )
+            if code != 0:
+                raise RuntimeError(
+                    f"Lite 6 move to pose {index} failed with error code {code}"
+                )
+            time.sleep(settle_seconds)
+
+            T_cam_board = collect_camera_transform(
+                zed,
+                runtime,
+                image_zed,
+                board,
+                detector,
+                camera_matrix,
+                dist_coeffs,
+                window_name=COLLECTION_WINDOW_NAME,
+            )
+            if T_cam_board is None:
+                print(f"[WARNING] Skipped pose {index}: board was not detected")
+                continue
+
+            T_base_ee_list.append(lite6.get_T_base_to_ee())
+            T_cam_board_list.append(T_cam_board)
+            save_collected_rt(T_base_ee_list, T_cam_board_list)
+            print(f"[INFO] Saved sample {len(T_base_ee_list) - 1}")
+
+        print(f"[INFO] Collected {len(T_base_ee_list)} synchronized samples")
+        return len(T_base_ee_list)
+    finally:
+        close_image_windows()
+        if zed is not None:
+            zed.close()
+        lite6.disconnect()
+
+
 # ======================================================
-# Li robot-world/hand-eye solve
+# Eye-hand calibration solvers
 # ======================================================
 
 def load_collected_transforms():
@@ -1048,9 +1527,90 @@ def solve_eye_hand_li(output_path=SOLUTION_FILE):
     return T_base_camera, T_ee_board
 
 
+def solve_eye_hand_tsai(output_path=TSAI_SOLUTION_FILE):
+    """Solve fixed-camera eye-to-hand calibration with the Tsai method.
+
+    For this eye-to-hand arrangement, ``calibrateHandEye`` receives
+    ``T_ee_base`` (the inverse of each measured ``T_base_ee``) as its
+    gripper-to-base input. Its returned camera-to-gripper transform is
+    therefore physically ``T_base_camera``.
+
+    Only ``T_base_camera`` is saved and returned; the board mounting
+    transform is intentionally not recovered.
+    """
+    T_base_ee, T_cam_board = load_collected_transforms()
+    T_ee_base = [invert_transform(T) for T in T_base_ee]
+
+    R_base_camera, t_base_camera = cv2.calibrateHandEye(
+        R_gripper2base=[T[:3, :3] for T in T_ee_base],
+        t_gripper2base=[T[:3, 3] for T in T_ee_base],
+        R_target2cam=[T[:3, :3] for T in T_cam_board],
+        t_target2cam=[T[:3, 3] for T in T_cam_board],
+        method=cv2.CALIB_HAND_EYE_TSAI,
+    )
+
+    T_base_camera = make_transform(R_base_camera, t_base_camera)
+    if not np.all(np.isfinite(T_base_camera)):
+        raise RuntimeError("The Tsai solver returned a non-finite transform.")
+
+    output_path = write_json(
+        output_path,
+        {"T_base_camera": T_base_camera.tolist()},
+    )
+    print(f"[INFO] Tsai calibration saved to {output_path}")
+    return T_base_camera
+
+
+def solve_eye_hand(method="li", output_path=None):
+    """Run the selected calibration solver and save its JSON result."""
+    method = str(method).strip().lower()
+    if method == "li":
+        return solve_eye_hand_li(output_path or SOLUTION_FILE)
+    if method == "tsai":
+        return solve_eye_hand_tsai(output_path or TSAI_SOLUTION_FILE)
+    raise ValueError("method must be either 'li' or 'tsai'.")
+
+
 # ======================================================
 # Plotting
 # ======================================================
+
+def set_3d_axes_equal(ax, points, padding=0.15):
+    """Apply equal metric scaling around a collection of 3D points."""
+    points = np.asarray(points, dtype=float).reshape(-1, 3)
+    minimum = np.min(points, axis=0)
+    maximum = np.max(points, axis=0)
+    center = (minimum + maximum) / 2.0
+    radius = max(float(np.max(maximum - minimum)) / 2.0, 0.05)
+    radius *= 1.0 + padding
+    ax.set_xlim(center[0] - radius, center[0] + radius)
+    ax.set_ylim(center[1] - radius, center[1] + radius)
+    ax.set_zlim(center[2] - radius, center[2] + radius)
+    ax.set_box_aspect((1, 1, 1))
+
+
+def draw_coordinate_frame(ax, transform, label, axis_length=0.08):
+    """Draw a labelled RGB coordinate frame on a 3D axis."""
+    transform = np.asarray(transform, dtype=float).reshape(4, 4)
+    origin = transform[:3, 3]
+    for axis_index, (color, axis_name) in enumerate(
+        (("red", "x"), ("green", "y"), ("blue", "z"))
+    ):
+        direction = transform[:3, axis_index] * axis_length
+        ax.quiver(
+            *origin,
+            *direction,
+            color=color,
+            linewidth=2.0,
+            arrow_length_ratio=0.18,
+        )
+        endpoint = origin + direction
+        ax.text(*endpoint, f"{label}.{axis_name}", color=color, fontsize=8)
+
+    ax.scatter(*origin, color="black", s=35, depthshade=False)
+    ax.text(*origin, f"  {label}", color="black", weight="bold")
+    return origin
+
 
 def plot_transform_set(ax, transforms, label, color, connect=False):
     """Plot transform origins and short coordinate axes on a 3D axis."""
@@ -1079,24 +1639,99 @@ def plot_transform_set(ax, transforms, label, color, connect=False):
     ax.set_ylabel("Y [m]")
     ax.set_zlabel("Z [m]")
     ax.legend()
-    ax.set_box_aspect((1, 1, 1))
+    set_3d_axes_equal(ax, np.vstack((positions, np.zeros((1, 3)))))
+    ax.grid(True, alpha=0.35)
+    ax.view_init(elev=25, azim=-55)
 
 
 def plot_trajectory(path=TRAJECTORY_FILE):
-    """Plot every commanded joint against trajectory point index."""
+    """Plot an SO-101 joint trajectory or a Lite 6 TCP trajectory."""
     import matplotlib.pyplot as plt
 
-    points = load_trajectory_file(path)
-    values = np.array(
-        [[point[name] for name in JOINT_NAMES] for point in points], dtype=float
-    )
-    figure, axis = plt.subplots()
-    for joint_index, name in enumerate(JOINT_NAMES):
-        axis.plot(values[:, joint_index], marker=".", label=name)
-    axis.set_xlabel("Trajectory point")
-    axis.set_ylabel("Robot command [deg]")
-    axis.grid(True)
-    axis.legend()
+    path = Path(path).resolve()
+    with open(path, "r", encoding="utf-8") as file:
+        raw_points = json.load(file)
+
+    if raw_points and set(raw_points[0]) == set(LITE6_POSE_NAMES):
+        points = validate_lite6_trajectory(raw_points)
+        values = np.asarray(
+            [[point[name] for name in LITE6_POSE_NAMES] for point in points],
+            dtype=float,
+        )
+        figure = plt.figure(figsize=(14, 5))
+        path_axis = figure.add_subplot(131, projection="3d")
+        xyz_axis = figure.add_subplot(132)
+        rpy_axis = figure.add_subplot(133)
+        sample_indices = np.arange(len(values))
+
+        path_axis.plot(
+            values[:, 0] / 1000.0,
+            values[:, 1] / 1000.0,
+            values[:, 2] / 1000.0,
+            marker="o",
+            markersize=3,
+            color="tab:blue",
+        )
+        path_axis.scatter(
+            values[0, 0] / 1000.0,
+            values[0, 1] / 1000.0,
+            values[0, 2] / 1000.0,
+            color="green",
+            s=70,
+            label="start",
+        )
+        path_axis.scatter(
+            values[-1, 0] / 1000.0,
+            values[-1, 1] / 1000.0,
+            values[-1, 2] / 1000.0,
+            color="red",
+            s=70,
+            label="end",
+        )
+        path_axis.set_title("Lite 6 Cartesian path")
+        path_axis.set_xlabel("X [m]")
+        path_axis.set_ylabel("Y [m]")
+        path_axis.set_zlabel("Z [m]")
+        path_axis.legend()
+        path_axis.grid(True, alpha=0.35)
+        path_axis.view_init(elev=25, azim=-55)
+        set_3d_axes_equal(path_axis, values[:, :3] / 1000.0)
+
+        for index, name in enumerate(LITE6_POSE_NAMES[:3]):
+            xyz_axis.plot(
+                sample_indices, values[:, index], marker=".", label=name
+            )
+        xyz_axis.set_title("TCP translation")
+        xyz_axis.set_xlabel("Trajectory point")
+        xyz_axis.set_ylabel("Position [mm]")
+        xyz_axis.grid(True, alpha=0.35)
+        xyz_axis.legend()
+
+        for index, name in enumerate(LITE6_POSE_NAMES[3:], start=3):
+            rpy_axis.plot(
+                sample_indices, values[:, index], marker=".", label=name
+            )
+        rpy_axis.set_title("TCP orientation")
+        rpy_axis.set_xlabel("Trajectory point")
+        rpy_axis.set_ylabel("Angle [deg]")
+        rpy_axis.grid(True, alpha=0.35)
+        rpy_axis.legend()
+    else:
+        points = validate_trajectory(raw_points)
+        values = np.array(
+            [[point[name] for name in JOINT_NAMES] for point in points],
+            dtype=float,
+        )
+        figure, axis = plt.subplots(figsize=(10, 6))
+        for joint_index, name in enumerate(JOINT_NAMES):
+            axis.plot(values[:, joint_index], marker=".", label=name)
+        axis.set_title("SO-101 joint trajectory")
+        axis.set_xlabel("Trajectory point")
+        axis.set_ylabel("Robot command [deg]")
+        axis.grid(True, alpha=0.35)
+        axis.legend(ncol=2)
+
+    figure.suptitle(path.name)
     figure.tight_layout()
     plt.show()
 
@@ -1115,13 +1750,106 @@ def plot_collected_data():
         robot_axis, T_base_ee, "T_base_ee", "tab:blue", connect=True
     )
     robot_axis.set_title("Measured robot poses")
+    set_3d_axes_equal(
+        robot_axis,
+        np.array([T[:3, 3] for T in T_base_ee] + [np.zeros(3)]),
+    )
 
     # Board observations are independent camera measurements, not a path.
     plot_transform_set(
         camera_axis, T_cam_board, "T_camera_board", "tab:orange", connect=False
     )
     camera_axis.set_title("Unsolved camera observations")
+    set_3d_axes_equal(
+        camera_axis,
+        np.array([T[:3, 3] for T in T_cam_board] + [np.zeros(3)]),
+    )
 
+    figure.tight_layout()
+    plt.show()
+
+
+def plot_solved_calibration(solution_path=SOLUTION_FILE):
+    """Plot solved camera and optional board poses in their parent frames."""
+    import matplotlib.pyplot as plt
+
+    solution_path = Path(solution_path).resolve()
+    with open(solution_path, "r", encoding="utf-8") as file:
+        result = json.load(file)
+
+    if "T_base_camera" not in result:
+        raise ValueError(f"{solution_path} does not contain T_base_camera.")
+
+    named_transforms = [
+        (
+            "Base",
+            "Camera",
+            "Camera pose in robot base frame",
+            np.asarray(result["T_base_camera"], dtype=float),
+        )
+    ]
+    if "T_ee_board" in result:
+        named_transforms.append(
+            (
+                "End effector",
+                "Board",
+                "Board pose in end-effector frame",
+                np.asarray(result["T_ee_board"], dtype=float),
+            )
+        )
+
+    for parent, child, _, transform in named_transforms:
+        if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
+            raise ValueError(f"T_{parent}_{child} must be a finite 4x4 matrix.")
+
+    figure = plt.figure(figsize=(7 * len(named_transforms), 6.5))
+    identity = np.eye(4)
+    for index, (parent, child, title, transform) in enumerate(
+        named_transforms, start=1
+    ):
+        axis = figure.add_subplot(
+            1, len(named_transforms), index, projection="3d"
+        )
+        parent_origin = draw_coordinate_frame(
+            axis, identity, parent, axis_length=0.08
+        )
+        child_origin = draw_coordinate_frame(
+            axis, transform, child, axis_length=0.08
+        )
+        axis.plot(
+            [parent_origin[0], child_origin[0]],
+            [parent_origin[1], child_origin[1]],
+            [parent_origin[2], child_origin[2]],
+            linestyle="--",
+            color="0.45",
+            linewidth=1.5,
+        )
+        translation = transform[:3, 3]
+        axis.text2D(
+            0.02,
+            0.96,
+            "translation [m]\n"
+            f"x={translation[0]:+.4f}\n"
+            f"y={translation[1]:+.4f}\n"
+            f"z={translation[2]:+.4f}",
+            transform=axis.transAxes,
+            va="top",
+            family="monospace",
+            bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "0.8"},
+        )
+        set_3d_axes_equal(
+            axis,
+            np.vstack((parent_origin, child_origin)),
+            padding=0.35,
+        )
+        axis.set_xlabel("X [m]")
+        axis.set_ylabel("Y [m]")
+        axis.set_zlabel("Z [m]")
+        axis.grid(True, alpha=0.35)
+        axis.view_init(elev=25, azim=-55)
+        axis.set_title(title)
+
+    figure.suptitle(f"Solved calibration: {solution_path.name}")
     figure.tight_layout()
     plt.show()
 
@@ -1131,28 +1859,69 @@ def plot_collected_data():
 # ======================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="SO-101 eye-hand calibration")
+    parser = argparse.ArgumentParser(description="Robot eye-hand calibration")
     commands = parser.add_subparsers(dest="command", required=True)
 
     commands.add_parser("pdf", help="Generate the printable ChArUco board")
 
     create = commands.add_parser("create", help="Create a trajectory manually")
-    create.add_argument("--output", type=Path, default=TRAJECTORY_FILE)
+    create.add_argument("--robot", choices=("so101", "lite6"), default="so101")
+    create.add_argument("--output", type=Path)
     create.add_argument("--port", default="/dev/ttyACM0")
     create.add_argument("--robot-id", default="dbot")
     create.add_argument("--step", type=float, default=2.0)
+    create.add_argument("--ip")
+    create.add_argument("--translation-step", type=float, default=5.0)
+    create.add_argument("--rotation-step", type=float, default=2.0)
+    create.add_argument("--speed", type=float, default=30.0)
+    create.add_argument(
+        "--control",
+        choices=("keyboard", "manual"),
+        default="keyboard",
+        help="Lite 6 pose control method",
+    )
+    create.add_argument(
+        "--interpolate",
+        type=int,
+        default=0,
+        metavar="N",
+        help="insert N poses between each captured Lite 6 pose",
+    )
+
+    lite6_control = commands.add_parser(
+        "lite6-control", help="Jog a Lite 6 with the keyboard"
+    )
+    lite6_control.add_argument("--ip", required=True)
+    lite6_control.add_argument("--translation-step", type=float, default=5.0)
+    lite6_control.add_argument("--rotation-step", type=float, default=2.0)
+    lite6_control.add_argument("--speed", type=float, default=30.0)
 
     delete = commands.add_parser("delete", help="Delete the trajectory")
     delete.add_argument("--trajectory", type=Path, default=TRAJECTORY_FILE)
 
     collect = commands.add_parser("collect", help="Collect calibration R/t data")
-    collect.add_argument("--trajectory", type=Path, default=TRAJECTORY_FILE)
+    collect.add_argument("--robot", choices=("so101", "lite6"), default="so101")
+    collect.add_argument("--trajectory", type=Path)
     collect.add_argument("--port", default="/dev/ttyACM0")
     collect.add_argument("--robot-id", default="dbot")
     collect.add_argument("--settle", type=float, default=10.0)
+    collect.add_argument("--ip")
+    collect.add_argument("--speed", type=float, default=30.0)
 
-    solve = commands.add_parser("solve", help="Solve using the Li method")
-    solve.add_argument("--output", type=Path, default=SOLUTION_FILE)
+    solve = commands.add_parser(
+        "solve", help="Solve with Li or Tsai"
+    )
+    solve.add_argument(
+        "--method",
+        choices=("li", "tsai"),
+        default="li",
+        help="Li returns base-camera and EE-board; Tsai returns base-camera only",
+    )
+    solve.add_argument(
+        "--output",
+        type=Path,
+        help="Optional result JSON path",
+    )
 
     plot_trajectory_command = commands.add_parser(
         "plot-trajectory", help="Plot the trajectory joints"
@@ -1161,30 +1930,71 @@ def main():
         "--trajectory", type=Path, default=TRAJECTORY_FILE
     )
     commands.add_parser("plot-collected", help="Plot unsolved collected poses")
+    plot_solved = commands.add_parser(
+        "plot-solved", help="Plot solved calibration transforms"
+    )
+    plot_solved.add_argument(
+        "--solution", type=Path, default=SOLUTION_FILE
+    )
 
     args = parser.parse_args()
 
     if args.command == "pdf":
         generateCharucoPDF()
     elif args.command == "create":
-        create_trajectory_with_keyboard(
-            args.output, args.port, args.robot_id, args.step
+        if args.robot == "lite6":
+            if not args.ip:
+                parser.error("create --robot lite6 requires --ip")
+            create_lite6_trajectory_with_keyboard(
+                args.ip,
+                args.output or LITE6_TRAJECTORY_FILE,
+                args.translation_step,
+                args.rotation_step,
+                args.speed,
+                args.control,
+                args.interpolate,
+            )
+        else:
+            create_trajectory_with_keyboard(
+                args.output or TRAJECTORY_FILE,
+                args.port,
+                args.robot_id,
+                args.step,
+            )
+    elif args.command == "lite6-control":
+        control_lite6_with_keyboard(
+            args.ip,
+            args.translation_step,
+            args.rotation_step,
+            args.speed,
         )
     elif args.command == "delete":
         delete_trajectory_file(args.trajectory)
     elif args.command == "collect":
-        collect_calibration_data(
-            args.trajectory,
-            args.port,
-            args.robot_id,
-            args.settle,
-        )
+        if args.robot == "lite6":
+            if not args.ip:
+                parser.error("collect --robot lite6 requires --ip")
+            collect_lite6_calibration_data(
+                args.ip,
+                args.trajectory or LITE6_TRAJECTORY_FILE,
+                args.settle,
+                args.speed,
+            )
+        else:
+            collect_calibration_data(
+                args.trajectory or TRAJECTORY_FILE,
+                args.port,
+                args.robot_id,
+                args.settle,
+            )
     elif args.command == "solve":
-        solve_eye_hand_li(args.output)
+        solve_eye_hand(args.method, args.output)
     elif args.command == "plot-trajectory":
         plot_trajectory(args.trajectory)
     elif args.command == "plot-collected":
         plot_collected_data()
+    elif args.command == "plot-solved":
+        plot_solved_calibration(args.solution)
 
 
 if __name__ == "__main__":
