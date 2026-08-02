@@ -588,6 +588,14 @@ JOINT_NAMES = (
     "gripper.pos",
 )
 LITE6_POSE_NAMES = ("x", "y", "z", "roll", "pitch", "yaw")
+LITE6_JOINT_NAMES = (
+    "joint_1_deg",
+    "joint_2_deg",
+    "joint_3_deg",
+    "joint_4_deg",
+    "joint_5_deg",
+    "joint_6_deg",
+)
 
 # OpenCV arrow-key codes vary with the active GUI backend.
 LEFT_ARROW_KEYS = {81, 2424832, 65361}
@@ -604,6 +612,65 @@ def write_json(path, value):
         file.write("\n")
     temporary.replace(path)
     return path
+
+
+def numeric_json(description, data):
+    """Build a JSON payload whose data section contains numbers only."""
+
+    if not isinstance(description, dict):
+        raise TypeError("description must be a dictionary.")
+    array = np.asarray(data, dtype=float)
+    if array.ndim == 0:
+        raise ValueError("JSON data must be an array, not a scalar.")
+    if not np.all(np.isfinite(array)):
+        raise ValueError("JSON data must contain finite numbers.")
+    return {
+        "description": description,
+        "data": array.tolist(),
+    }
+
+
+def read_json_data(path):
+    """Read numeric data from the new format or a legacy bare JSON array."""
+
+    path = Path(path).resolve()
+    with open(path, "r", encoding="utf-8") as file:
+        payload = json.load(file)
+    if isinstance(payload, dict) and "data" in payload:
+        description = payload.get("description", {})
+        if not isinstance(description, dict):
+            raise ValueError(f"{path}: description must be an object.")
+        try:
+            numeric_data = np.asarray(payload["data"], dtype=float)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{path}: data must contain numbers only.") from error
+        if not np.all(np.isfinite(numeric_data)):
+            raise ValueError(f"{path}: data contains non-finite numbers.")
+        return payload["data"], description
+    return payload, {}
+
+
+def numeric_rows_to_points(data, names):
+    """Convert an N-column numeric matrix to internal named point records."""
+
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return data
+
+    rows = np.asarray(data, dtype=float)
+    expected_columns = len(names)
+    if rows.ndim != 2 or rows.shape[1] != expected_columns:
+        raise ValueError(
+            f"Trajectory data must have shape (N, {expected_columns})."
+        )
+    if not np.all(np.isfinite(rows)):
+        raise ValueError("Trajectory data contains non-finite numbers.")
+    return [
+        {
+            name: float(row[index])
+            for index, name in enumerate(names)
+        }
+        for row in rows
+    ]
 
 
 def validate_trajectory(points):
@@ -638,21 +705,33 @@ def validate_trajectory(points):
 
 
 def save_trajectory_file(points, path=TRAJECTORY_FILE):
-    """Save only the ordered trajectory points."""
+    """Save ordered joint poses as a numeric matrix."""
     path = Path(path).resolve()
     if path.suffix.lower() != ".json":
         raise ValueError("Trajectory path must end in .json.")
     points = validate_trajectory(points)
-    write_json(path, points)
+    data = [
+        [point[name] for name in JOINT_NAMES]
+        for point in points
+    ]
+    payload = numeric_json(
+        {
+            "summary": "SO-101 calibration joint trajectory.",
+            "columns": list(JOINT_NAMES),
+            "units": "degrees",
+        },
+        data,
+    )
+    write_json(path, payload)
     print(f"[INFO] Saved {len(points)} points to {path}")
     return path
 
 
 def load_trajectory_file(path=TRAJECTORY_FILE):
-    """Load the bare trajectory point list."""
+    """Load a numeric or legacy SO-101 trajectory."""
     path = Path(path).resolve()
-    with open(path, "r", encoding="utf-8") as file:
-        return validate_trajectory(json.load(file))
+    data, _ = read_json_data(path)
+    return validate_trajectory(numeric_rows_to_points(data, JOINT_NAMES))
 
 
 def validate_lite6_trajectory(points):
@@ -680,13 +759,41 @@ def validate_lite6_trajectory(points):
     return clean_points
 
 
-def save_lite6_trajectory_file(points, path=LITE6_TRAJECTORY_FILE):
-    """Save an ordered list of absolute Lite 6 TCP poses."""
+def save_lite6_trajectory_file(
+    points,
+    path=LITE6_TRAJECTORY_FILE,
+    group_ranges=None,
+    joint_limits_checked=False,
+):
+    """Save absolute Lite 6 TCP poses as a numeric matrix."""
     path = Path(path).resolve()
     if path.suffix.lower() != ".json":
         raise ValueError("Trajectory path must end in .json.")
     points = validate_lite6_trajectory(points)
-    write_json(path, points)
+    data = [
+        [point[name] for name in LITE6_POSE_NAMES]
+        for point in points
+    ]
+    description = {
+        "summary": "Lite 6 absolute TCP calibration trajectory.",
+        "columns": list(LITE6_POSE_NAMES),
+        "units": [
+            "millimeters",
+            "millimeters",
+            "millimeters",
+            "degrees",
+            "degrees",
+            "degrees",
+        ],
+        "lite6_joint_min_deg": list(robot.Lite6.JOINT_MIN_DEG),
+        "lite6_joint_max_deg": list(robot.Lite6.JOINT_MAX_DEG),
+        "all_poses_ik_joint_limit_checked": bool(joint_limits_checked),
+    }
+    if group_ranges is not None:
+        description["interpolation_groups"] = group_ranges
+        description["interpolation_crosses_groups"] = False
+    payload = numeric_json(description, data)
+    write_json(path, payload)
     print(f"[INFO] Saved {len(points)} Lite 6 poses to {path}")
     return path
 
@@ -694,8 +801,10 @@ def save_lite6_trajectory_file(points, path=LITE6_TRAJECTORY_FILE):
 def load_lite6_trajectory_file(path=LITE6_TRAJECTORY_FILE):
     """Load and validate an absolute Lite 6 TCP trajectory."""
     path = Path(path).resolve()
-    with open(path, "r", encoding="utf-8") as file:
-        return validate_lite6_trajectory(json.load(file))
+    data, _ = read_json_data(path)
+    return validate_lite6_trajectory(
+        numeric_rows_to_points(data, LITE6_POSE_NAMES)
+    )
 
 
 def interpolate_lite6_trajectory(points, points_between=0):
@@ -736,6 +845,218 @@ def interpolate_lite6_trajectory(points, points_between=0):
         }
         for pose in interpolated
     ]
+
+
+def interpolate_lite6_groups(
+    groups,
+    points_between=0,
+    requested_points=None,
+):
+    """Interpolate only inside explicit visibility-safe pose groups."""
+    clean_groups = [
+        validate_lite6_trajectory(group)
+        for group in groups
+        if group
+    ]
+    if not clean_groups:
+        raise ValueError("At least one non-empty group is required.")
+    if points_between < 0:
+        raise ValueError("points_between cannot be negative.")
+
+    captured_count = sum(len(group) for group in clean_groups)
+    edges = [
+        (group_index, edge_index)
+        for group_index, group in enumerate(clean_groups)
+        for edge_index in range(len(group) - 1)
+    ]
+
+    if requested_points is not None:
+        if requested_points < captured_count:
+            raise ValueError(
+                f"--points must be at least the {captured_count} captured poses."
+            )
+        extra_points = requested_points - captured_count
+        if extra_points and not edges:
+            raise ValueError(
+                "Interpolation requires at least two poses in one group."
+            )
+        base, remainder = divmod(extra_points, len(edges)) if edges else (0, 0)
+        edge_counts = {
+            edge: base + (index < remainder)
+            for index, edge in enumerate(edges)
+        }
+    else:
+        edge_counts = {edge: int(points_between) for edge in edges}
+
+    generated = []
+    group_ranges = []
+    for group_index, group in enumerate(clean_groups):
+        start_index = len(generated)
+        if len(group) == 1:
+            generated.extend(group)
+        else:
+            for edge_index, (start, end) in enumerate(zip(group[:-1], group[1:])):
+                segment = interpolate_lite6_trajectory(
+                    [start, end],
+                    edge_counts[(group_index, edge_index)],
+                )
+                generated.extend(segment[:-1])
+            generated.append(group[-1])
+        group_ranges.append(
+            {
+                "group_index": group_index,
+                "captured_pose_count": len(group),
+                "trajectory_start_index": start_index,
+                "trajectory_end_index": len(generated) - 1,
+            }
+        )
+
+    return generated, group_ranges
+
+
+def validate_lite6_joint_trajectory(points, clip=False):
+    """Validate Lite 6 joint records, optionally clipping every joint."""
+    if not isinstance(points, list) or not points:
+        raise ValueError("Lite 6 joint trajectory must be a non-empty list.")
+    clean = []
+    for index, point in enumerate(points):
+        if not isinstance(point, dict) or set(point) != set(LITE6_JOINT_NAMES):
+            raise ValueError(
+                f"Joint point {index} must contain exactly: {LITE6_JOINT_NAMES}"
+            )
+        angles = np.asarray(
+            [point[name] for name in LITE6_JOINT_NAMES], dtype=float
+        )
+        angles = (
+            robot.Lite6.clip_joint_angles_deg(angles)
+            if clip
+            else robot.Lite6.validate_joint_angles_deg(
+                angles, context=f"Lite 6 trajectory point {index}"
+            )
+        )
+        clean.append(
+            {
+                name: float(angles[joint_index])
+                for joint_index, name in enumerate(LITE6_JOINT_NAMES)
+            }
+        )
+    return clean
+
+
+def interpolate_lite6_joint_groups(
+    groups,
+    points_between=0,
+    requested_points=None,
+):
+    """Linearly interpolate clipped joint angles only within each group."""
+    clean_groups = [
+        validate_lite6_joint_trajectory(group, clip=True)
+        for group in groups
+        if group
+    ]
+    if not clean_groups:
+        raise ValueError("At least one non-empty joint group is required.")
+
+    captured_count = sum(len(group) for group in clean_groups)
+    edges = [
+        (group_index, edge_index)
+        for group_index, group in enumerate(clean_groups)
+        for edge_index in range(len(group) - 1)
+    ]
+    if requested_points is not None:
+        if requested_points < captured_count:
+            raise ValueError(
+                f"--points must be at least the {captured_count} captured poses."
+            )
+        extra = requested_points - captured_count
+        if extra and not edges:
+            raise ValueError(
+                "Interpolation requires at least two poses in one group."
+            )
+        base, remainder = divmod(extra, len(edges)) if edges else (0, 0)
+        edge_counts = {
+            edge: base + (edge_number < remainder)
+            for edge_number, edge in enumerate(edges)
+        }
+    else:
+        if points_between < 0:
+            raise ValueError("points_between cannot be negative.")
+        edge_counts = {edge: int(points_between) for edge in edges}
+
+    generated = []
+    group_ranges = []
+    for group_index, group in enumerate(clean_groups):
+        start_index = len(generated)
+        for edge_index, (start, end) in enumerate(zip(group[:-1], group[1:])):
+            start_angles = np.asarray(
+                [start[name] for name in LITE6_JOINT_NAMES], dtype=float
+            )
+            end_angles = np.asarray(
+                [end[name] for name in LITE6_JOINT_NAMES], dtype=float
+            )
+            generated.append(start)
+            number_between = edge_counts[(group_index, edge_index)]
+            for step in range(1, number_between + 1):
+                fraction = step / (number_between + 1)
+                angles = robot.Lite6.clip_joint_angles_deg(
+                    start_angles + fraction * (end_angles - start_angles)
+                )
+                generated.append(
+                    {
+                        name: float(angles[index])
+                        for index, name in enumerate(LITE6_JOINT_NAMES)
+                    }
+                )
+        generated.append(group[-1])
+        group_ranges.append(
+            {
+                "group_index": group_index,
+                "captured_pose_count": len(group),
+                "trajectory_start_index": start_index,
+                "trajectory_end_index": len(generated) - 1,
+            }
+        )
+    return validate_lite6_joint_trajectory(generated), group_ranges
+
+
+def save_lite6_joint_trajectory_file(
+    points,
+    path=LITE6_TRAJECTORY_FILE,
+    group_ranges=None,
+):
+    """Save a clipped Lite 6 joint-space calibration trajectory."""
+    path = Path(path).resolve()
+    if path.suffix.lower() != ".json":
+        raise ValueError("Trajectory path must end in .json.")
+    points = validate_lite6_joint_trajectory(points, clip=True)
+    data = [[point[name] for name in LITE6_JOINT_NAMES] for point in points]
+    description = {
+        "summary": "Lite 6 joint-space calibration trajectory.",
+        "columns": list(LITE6_JOINT_NAMES),
+        "units": "degrees",
+        "lite6_joint_min_deg": list(robot.Lite6.JOINT_MIN_DEG),
+        "lite6_joint_max_deg": list(robot.Lite6.JOINT_MAX_DEG),
+        "interpolation_space": "joint_angles",
+        "interpolation_crosses_groups": False,
+    }
+    if group_ranges is not None:
+        description["interpolation_groups"] = group_ranges
+    path = write_json(path, numeric_json(description, data))
+    print(f"[INFO] Saved {len(points)} Lite 6 joint poses to {path}")
+    return path
+
+
+def load_lite6_joint_trajectory_file(path=LITE6_TRAJECTORY_FILE):
+    """Load a Lite 6 joint-space trajectory and enforce its limits."""
+    data, description = read_json_data(path)
+    if description.get("columns") != list(LITE6_JOINT_NAMES):
+        raise ValueError(
+            "Lite 6 collection requires a joint-space trajectory. "
+            "Recreate any legacy or XYZ/RPY trajectory with the current "
+            "create command."
+        )
+    points = numeric_rows_to_points(data, LITE6_JOINT_NAMES)
+    return validate_lite6_joint_trajectory(points)
 
 
 def delete_trajectory_file(path=TRAJECTORY_FILE):
@@ -1123,6 +1444,176 @@ def create_lite6_trajectory_with_keyboard(
     )
 
 
+def create_lite6_trajectory_with_preview(
+    ip_address,
+    path=LITE6_TRAJECTORY_FILE,
+    points_between=0,
+    requested_points=None,
+):
+    """Capture UFactory-Studio-controlled poses from the camera preview.
+
+    This function never commands robot motion or changes the controller mode.
+    Move the Lite 6 with UFactory Studio, then use the OpenCV preview keys to
+    record clipped six-joint configurations. Interpolation is performed in
+    joint space, restricted to the current group, and never crosses an ``N``
+    group boundary. TCP XYZ/RPY is displayed for operator reference only.
+    """
+    if points_between < 0:
+        raise ValueError("points_between cannot be negative.")
+    if requested_points is not None and requested_points < 2:
+        raise ValueError("requested_points must be at least 2.")
+
+    lite6 = robot.Lite6(ip_address)
+    groups = [[]]
+    zed = None
+    preview_window = "Lite 6 UFactory Studio trajectory capture"
+    status = "Move the robot in UFactory Studio, then press S to save."
+
+    try:
+        # Passive connection: do not clear faults, change modes, or command
+        # motion while UFactory Studio owns robot control.
+        lite6.connect(prepare=False)
+        zed, runtime, image_zed = open_zed()
+        camera_matrix, dist_coeffs = get_zed_left_intrinsics_rectified(zed)
+        board, detector = create_charuco_detector(
+            DEFAULT_CHARUCO_CONFIG,
+            camera_matrix,
+            dist_coeffs,
+        )
+        cv2.namedWindow(preview_window, cv2.WINDOW_NORMAL)
+
+        while True:
+            image = get_image(zed, runtime, image_zed)
+            if image is None:
+                continue
+
+            detection = detect_charuco_board(image, board, detector)
+            board_pose = estimate_charuco_pose(
+                detection,
+                board,
+                camera_matrix,
+                dist_coeffs,
+            )
+            code, tcp_pose = lite6.arm.get_position(is_radian=False)
+            if code != 0:
+                raise RuntimeError(
+                    f"Could not read Lite 6 TCP pose; error code: {code}"
+                )
+            tcp_pose = np.asarray(tcp_pose[:6], dtype=float)
+            joint_code, joint_angles = lite6.arm.get_servo_angle(
+                is_radian=False
+            )
+            if joint_code != 0:
+                raise RuntimeError(
+                    "Could not read Lite 6 joint angles; "
+                    f"error code: {joint_code}"
+                )
+            joint_angles = np.asarray(joint_angles[:6], dtype=float)
+            clipped_joint_angles = robot.Lite6.clip_joint_angles_deg(
+                joint_angles
+            )
+            saved_count = sum(len(group) for group in groups)
+            board_status = (
+                f"markers={detection.num_markers}/{len(board.getIds())}, "
+                f"corners={detection.num_charuco_corners}/"
+                f"{DEFAULT_CHARUCO_CONFIG.max_charuco_corners}, "
+                f"pose={'yes' if board_pose is not None else 'no'}"
+            )
+            lines = (
+                "Move in UFactory Studio; this preview saves JOINT ANGLES only",
+                "S/C save | N new group | U/Backspace undo | Q finish | ESC cancel",
+                f"Group {len(groups) - 1}: {len(groups[-1])} poses | total: {saved_count}",
+                board_status,
+                "TCP [mm, deg]: " + " ".join(f"{value:.2f}" for value in tcp_pose),
+                "Joints [deg]: "
+                + " ".join(f"{value:.2f}" for value in clipped_joint_angles),
+                status,
+            )
+            key = show_image(
+                preview_window,
+                image,
+                lines,
+                detection,
+                board_pose,
+                camera_matrix,
+                dist_coeffs,
+                wait_ms=20,
+            )
+            if key == -1:
+                continue
+            if key == 27:
+                print("[INFO] Lite 6 trajectory creation cancelled.")
+                return None
+            key = ord(chr(key).lower()) if 0 <= key <= 255 else key
+
+            if key in (ord("s"), ord("c")):
+                point = {
+                    name: float(clipped_joint_angles[index])
+                    for index, name in enumerate(LITE6_JOINT_NAMES)
+                }
+                if groups[-1]:
+                    previous = np.asarray(
+                        [groups[-1][-1][name] for name in LITE6_JOINT_NAMES]
+                    )
+                    if np.allclose(previous, clipped_joint_angles, atol=1e-4):
+                        status = "Pose not saved: it duplicates the previous pose."
+                        continue
+                groups[-1].append(point)
+                visibility = (
+                    "full board visible"
+                    if detection.all_corners_detected
+                    else "board is not fully visible"
+                )
+                status = (
+                    f"Saved group {len(groups) - 1}, pose "
+                    f"{len(groups[-1]) - 1}; {visibility}."
+                )
+                if not np.allclose(joint_angles, clipped_joint_angles):
+                    status += " One or more joint angles were clipped."
+            elif key == ord("n"):
+                if not groups[-1]:
+                    status = "Current group is empty; save a pose first."
+                    continue
+                groups.append([])
+                status = (
+                    f"Started group {len(groups) - 1}; interpolation will not "
+                    "cross this boundary."
+                )
+            elif key in (ord("u"), 8, 127):
+                if not groups[-1] and len(groups) > 1:
+                    groups.pop()
+                if groups[-1]:
+                    groups[-1].pop()
+                    status = "Removed the most recently saved pose."
+                else:
+                    status = "There is no saved pose to remove."
+            elif key == ord("q"):
+                clean_groups = [group for group in groups if group]
+                captured_count = sum(len(group) for group in clean_groups)
+                if captured_count < 2:
+                    status = "Save at least two poses before finishing."
+                    continue
+                try:
+                    generated, group_ranges = interpolate_lite6_joint_groups(
+                        clean_groups,
+                        points_between=points_between,
+                        requested_points=requested_points,
+                    )
+                except ValueError as error:
+                    status = str(error)
+                    continue
+                return save_lite6_joint_trajectory_file(
+                    generated,
+                    path,
+                    group_ranges=group_ranges,
+                )
+    finally:
+        close_image_windows()
+        if zed is not None:
+            zed.close()
+        lite6.disconnect()
+
+
 def create_trajectory_with_keyboard(
     path=TRAJECTORY_FILE,
     port="/dev/ttyACM0",
@@ -1288,13 +1779,29 @@ def save_collected_rt(T_base_ee_list, T_cam_board_list):
         raise ValueError("Robot and camera sample counts do not match.")
 
     values = {
-        R_BASE_EE_FILE: [T[:3, :3].tolist() for T in T_base_ee_list],
-        T_BASE_EE_FILE: [T[:3, 3].tolist() for T in T_base_ee_list],
-        R_CAM_BOARD_FILE: [T[:3, :3].tolist() for T in T_cam_board_list],
-        T_CAM_BOARD_FILE: [T[:3, 3].tolist() for T in T_cam_board_list],
+        R_BASE_EE_FILE: (
+            "R_base_ee rotation matrices; data shape is [sample, row, column].",
+            [T[:3, :3].tolist() for T in T_base_ee_list],
+        ),
+        T_BASE_EE_FILE: (
+            "t_base_ee vectors; columns are [x, y, z] in meters.",
+            [T[:3, 3].tolist() for T in T_base_ee_list],
+        ),
+        R_CAM_BOARD_FILE: (
+            "R_camera_board rotation matrices; data shape is "
+            "[sample, row, column].",
+            [T[:3, :3].tolist() for T in T_cam_board_list],
+        ),
+        T_CAM_BOARD_FILE: (
+            "t_camera_board vectors; columns are [x, y, z] in meters.",
+            [T[:3, 3].tolist() for T in T_cam_board_list],
+        ),
     }
-    for path, value in values.items():
-        write_json(path, value)
+    for path, (summary, data) in values.items():
+        write_json(
+            path,
+            numeric_json({"summary": summary}, data),
+        )
 
 
 def collect_calibration_data(
@@ -1387,32 +1894,34 @@ def collect_lite6_calibration_data(
     ip_address,
     trajectory_path=LITE6_TRAJECTORY_FILE,
     settle_seconds=3.0,
-    speed_mm_s=30.0,
+    speed_deg_s=30.0,
 ):
-    """Replay a Lite 6 TCP trajectory and collect synchronized calibration data."""
+    """Replay Lite 6 joint angles and collect synchronized transforms."""
     if settle_seconds < 0:
         raise ValueError("settle_seconds cannot be negative.")
-    if speed_mm_s <= 0:
-        raise ValueError("speed_mm_s must be positive.")
+    if speed_deg_s <= 0:
+        raise ValueError("speed_deg_s must be positive.")
 
-    trajectory = load_lite6_trajectory_file(trajectory_path)
+    trajectory = load_lite6_joint_trajectory_file(trajectory_path)
     lite6 = robot.Lite6(ip_address)
     zed = None
     T_base_ee_list = []
     T_cam_board_list = []
 
     confirmation = input(
-        f"This will move the Lite 6 through {len(trajectory)} absolute TCP "
+        f"This will move the Lite 6 through {len(trajectory)} joint poses "
         "poses and overwrite old R/t data. Type RUN to continue: "
     ).strip()
     if confirmation != "RUN":
         print("[INFO] Collection cancelled")
         return None
 
-    save_collected_rt([], [])
-
     try:
         lite6.connect()
+        print(
+            f"[INFO] Loaded {len(trajectory)} clipped, joint-limit-checked poses."
+        )
+        save_collected_rt([], [])
         zed, runtime, image_zed = open_zed()
         camera_matrix, dist_coeffs = get_zed_left_intrinsics_rectified(zed)
         board, detector = create_charuco_detector(
@@ -1422,9 +1931,10 @@ def collect_lite6_calibration_data(
 
         for index, target in enumerate(trajectory):
             print(f"[INFO] Lite 6 pose {index + 1}/{len(trajectory)}")
-            code = lite6.arm.set_position(
-                **target,
-                speed=speed_mm_s,
+            target_angles = [target[name] for name in LITE6_JOINT_NAMES]
+            code = lite6.arm.set_servo_angle(
+                angle=target_angles,
+                speed=speed_deg_s,
                 wait=True,
                 is_radian=False,
             )
@@ -1476,13 +1986,29 @@ def load_collected_transforms():
     )
     arrays = []
     for path in paths:
-        with open(path, "r", encoding="utf-8") as file:
-            arrays.append(json.load(file))
+        data, _ = read_json_data(path)
+        arrays.append(data)
 
+    arrays = [
+        np.asarray(values, dtype=float)
+        for values in arrays
+    ]
     R_base_ee, t_base_ee, R_cam_board, t_cam_board = arrays
     counts = {len(values) for values in arrays}
     if len(counts) != 1 or not counts or next(iter(counts)) < 3:
         raise ValueError("The four R/t files must contain at least 3 samples.")
+    sample_count = next(iter(counts))
+    expected_shapes = (
+        (sample_count, 3, 3),
+        (sample_count, 3),
+        (sample_count, 3, 3),
+        (sample_count, 3),
+    )
+    for path, values, expected_shape in zip(paths, arrays, expected_shapes):
+        if values.shape != expected_shape or not np.all(np.isfinite(values)):
+            raise ValueError(
+                f"{path} must contain finite data shaped {expected_shape}."
+            )
 
     T_base_ee = [
         make_transform(R, t) for R, t in zip(R_base_ee, t_base_ee)
@@ -1518,10 +2044,15 @@ def solve_eye_hand_li(output_path=SOLUTION_FILE):
         and np.all(np.isfinite(T_ee_board))
     ):
         raise RuntimeError("The Li solver returned a non-finite transform.")
-    result = {
-        "T_base_camera": T_base_camera.tolist(),
-        "T_ee_board": T_ee_board.tolist(),
-    }
+    result = numeric_json(
+        {
+            "summary": "Li eye-to-hand calibration transforms.",
+            "axis_0_order": ["T_base_camera", "T_ee_board"],
+            "matrix_layout": "4x4 homogeneous transforms",
+            "translation_units": "meters",
+        },
+        np.stack((T_base_camera, T_ee_board)),
+    )
     output_path = write_json(output_path, result)
     print(f"[INFO] Li calibration saved to {output_path}")
     return T_base_camera, T_ee_board
@@ -1555,7 +2086,15 @@ def solve_eye_hand_tsai(output_path=TSAI_SOLUTION_FILE):
 
     output_path = write_json(
         output_path,
-        {"T_base_camera": T_base_camera.tolist()},
+        numeric_json(
+            {
+                "summary": "Tsai eye-to-hand calibration transform.",
+                "axis_0_order": ["T_base_camera"],
+                "matrix_layout": "4x4 homogeneous transform",
+                "translation_units": "meters",
+            },
+            T_base_camera[np.newaxis, :, :],
+        ),
     )
     print(f"[INFO] Tsai calibration saved to {output_path}")
     return T_base_camera
@@ -1649,11 +2188,51 @@ def plot_trajectory(path=TRAJECTORY_FILE):
     import matplotlib.pyplot as plt
 
     path = Path(path).resolve()
-    with open(path, "r", encoding="utf-8") as file:
-        raw_points = json.load(file)
+    raw_points, description = read_json_data(path)
 
-    if raw_points and set(raw_points[0]) == set(LITE6_POSE_NAMES):
-        points = validate_lite6_trajectory(raw_points)
+    is_lite6_joint = (
+        description.get("columns") == list(LITE6_JOINT_NAMES)
+        or (
+            raw_points
+            and isinstance(raw_points[0], dict)
+            and set(raw_points[0]) == set(LITE6_JOINT_NAMES)
+        )
+    )
+    is_lite6_tcp = (
+        description.get("columns") == list(LITE6_POSE_NAMES)
+        or (
+            raw_points
+            and isinstance(raw_points[0], dict)
+            and set(raw_points[0]) == set(LITE6_POSE_NAMES)
+        )
+    )
+
+    if is_lite6_joint:
+        points = validate_lite6_joint_trajectory(
+            numeric_rows_to_points(raw_points, LITE6_JOINT_NAMES)
+        )
+        values = np.asarray(
+            [[point[name] for name in LITE6_JOINT_NAMES] for point in points],
+            dtype=float,
+        )
+        figure, axes = plt.subplots(2, 3, figsize=(14, 8), sharex=True)
+        sample_indices = np.arange(len(values))
+        lower = robot.Lite6.JOINT_MIN_DEG
+        upper = robot.Lite6.JOINT_MAX_DEG
+        for index, axis in enumerate(axes.flat):
+            axis.plot(sample_indices, values[:, index], color="tab:blue")
+            axis.axhline(lower[index], color="red", linestyle="--")
+            axis.axhline(upper[index], color="red", linestyle="--")
+            axis.set_title(f"Lite 6 Joint {index + 1}")
+            axis.set_ylabel("Angle [deg]")
+            axis.grid(True, alpha=0.35)
+        for axis in axes[-1]:
+            axis.set_xlabel("Trajectory point")
+        figure.suptitle(f"{path.name} — joint-space trajectory")
+    elif is_lite6_tcp:
+        points = validate_lite6_trajectory(
+            numeric_rows_to_points(raw_points, LITE6_POSE_NAMES)
+        )
         values = np.asarray(
             [[point[name] for name in LITE6_POSE_NAMES] for point in points],
             dtype=float,
@@ -1664,14 +2243,49 @@ def plot_trajectory(path=TRAJECTORY_FILE):
         rpy_axis = figure.add_subplot(133)
         sample_indices = np.arange(len(values))
 
-        path_axis.plot(
-            values[:, 0] / 1000.0,
-            values[:, 1] / 1000.0,
-            values[:, 2] / 1000.0,
-            marker="o",
-            markersize=3,
-            color="tab:blue",
-        )
+        group_ranges = description.get("interpolation_groups", [])
+        if group_ranges:
+            colors = plt.cm.tab10(np.linspace(0.0, 1.0, len(group_ranges)))
+            previous_end = None
+            transition_labeled = False
+            for group, color in zip(group_ranges, colors):
+                start = int(group["trajectory_start_index"])
+                end = int(group["trajectory_end_index"]) + 1
+                group_values = values[start:end, :3] / 1000.0
+                path_axis.plot(
+                    group_values[:, 0],
+                    group_values[:, 1],
+                    group_values[:, 2],
+                    marker="o",
+                    markersize=3,
+                    color=color,
+                    label=f"group {group['group_index']}",
+                )
+                if previous_end is not None:
+                    path_axis.plot(
+                        [previous_end[0], group_values[0, 0]],
+                        [previous_end[1], group_values[0, 1]],
+                        [previous_end[2], group_values[0, 2]],
+                        linestyle=":",
+                        color="0.6",
+                        label=(
+                            "non-interpolated group transition"
+                            if not transition_labeled
+                            else None
+                        ),
+                    )
+                    transition_labeled = True
+                previous_end = group_values[-1]
+        else:
+            path_axis.plot(
+                values[:, 0] / 1000.0,
+                values[:, 1] / 1000.0,
+                values[:, 2] / 1000.0,
+                marker="o",
+                markersize=3,
+                color="tab:blue",
+                label="trajectory",
+            )
         path_axis.scatter(
             values[0, 0] / 1000.0,
             values[0, 1] / 1000.0,
@@ -1717,7 +2331,9 @@ def plot_trajectory(path=TRAJECTORY_FILE):
         rpy_axis.grid(True, alpha=0.35)
         rpy_axis.legend()
     else:
-        points = validate_trajectory(raw_points)
+        points = validate_trajectory(
+            numeric_rows_to_points(raw_points, JOINT_NAMES)
+        )
         values = np.array(
             [[point[name] for name in JOINT_NAMES] for point in points],
             dtype=float,
@@ -1776,6 +2392,17 @@ def plot_solved_calibration(solution_path=SOLUTION_FILE):
     solution_path = Path(solution_path).resolve()
     with open(solution_path, "r", encoding="utf-8") as file:
         result = json.load(file)
+
+    if "data" in result:
+        transform_data = result["data"]
+        transform_names = result.get("description", {}).get(
+            "axis_0_order",
+            [],
+        )
+        result = {
+            name: transform_data[index]
+            for index, name in enumerate(transform_names)
+        }
 
     if "T_base_camera" not in result:
         raise ValueError(f"{solution_path} does not contain T_base_camera.")
@@ -1864,28 +2491,28 @@ def main():
 
     commands.add_parser("pdf", help="Generate the printable ChArUco board")
 
-    create = commands.add_parser("create", help="Create a trajectory manually")
+    create = commands.add_parser(
+        "create",
+        help="Create a trajectory (Lite 6 uses UFactory Studio + preview)",
+    )
     create.add_argument("--robot", choices=("so101", "lite6"), default="so101")
     create.add_argument("--output", type=Path)
     create.add_argument("--port", default="/dev/ttyACM0")
     create.add_argument("--robot-id", default="dbot")
     create.add_argument("--step", type=float, default=2.0)
     create.add_argument("--ip")
-    create.add_argument("--translation-step", type=float, default=5.0)
-    create.add_argument("--rotation-step", type=float, default=2.0)
-    create.add_argument("--speed", type=float, default=30.0)
-    create.add_argument(
-        "--control",
-        choices=("keyboard", "manual"),
-        default="keyboard",
-        help="Lite 6 pose control method",
-    )
-    create.add_argument(
+    interpolation = create.add_mutually_exclusive_group()
+    interpolation.add_argument(
         "--interpolate",
         type=int,
         default=0,
         metavar="N",
-        help="insert N poses between each captured Lite 6 pose",
+        help="insert N joint poses per segment, only within each Lite 6 group",
+    )
+    interpolation.add_argument(
+        "--points",
+        type=int,
+        help="generate exactly this many Lite 6 joint poses across all groups",
     )
 
     lite6_control = commands.add_parser(
@@ -1906,7 +2533,12 @@ def main():
     collect.add_argument("--robot-id", default="dbot")
     collect.add_argument("--settle", type=float, default=10.0)
     collect.add_argument("--ip")
-    collect.add_argument("--speed", type=float, default=30.0)
+    collect.add_argument(
+        "--speed",
+        type=float,
+        default=30.0,
+        help="Lite 6 joint speed in degrees/second",
+    )
 
     solve = commands.add_parser(
         "solve", help="Solve with Li or Tsai"
@@ -1945,14 +2577,11 @@ def main():
         if args.robot == "lite6":
             if not args.ip:
                 parser.error("create --robot lite6 requires --ip")
-            create_lite6_trajectory_with_keyboard(
+            create_lite6_trajectory_with_preview(
                 args.ip,
                 args.output or LITE6_TRAJECTORY_FILE,
-                args.translation_step,
-                args.rotation_step,
-                args.speed,
-                args.control,
                 args.interpolate,
+                args.points,
             )
         else:
             create_trajectory_with_keyboard(

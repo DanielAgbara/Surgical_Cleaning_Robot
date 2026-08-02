@@ -1815,6 +1815,8 @@ class Lite6:
 
     # UFACTORY Studio's documented Lite 6 "Initial Position" in degrees.
     INITIAL_JOINT_ANGLES_DEG = (0.0, 9.9, 31.8, 0.0, 21.9, 0.0)
+    JOINT_MIN_DEG = (-360.0, -150.0, -3.5, -360.0, -124.0, -360.0)
+    JOINT_MAX_DEG = (360.0, 150.0, 300.0, 360.0, 124.0, 360.0)
 
     def __init__(self, ip_address):
         self.ip_address = str(ip_address)
@@ -1847,8 +1849,8 @@ class Lite6:
         )
         return Lite6.T_mm_to_meters(T_mm)
 
-    def connect(self):
-        """Connect and prepare the Lite 6 for position commands."""
+    def connect(self, prepare=True):
+        """Connect to the Lite 6, optionally preparing it for motion."""
         if self.arm is not None:
             return
 
@@ -1866,11 +1868,12 @@ class Lite6:
         )
         self.arm.connect()
 
-        try:
-            self.reset_state()
-        except Exception:
-            self.disconnect()
-            raise
+        if prepare:
+            try:
+                self.reset_state()
+            except Exception:
+                self.disconnect()
+                raise
 
     def reset_state(self):
         """Clear controller faults and restore ready Cartesian position mode."""
@@ -1892,6 +1895,48 @@ class Lite6:
                 raise RuntimeError(
                     f"Could not {operation}; Lite 6 error code: {code}"
                 )
+
+    @classmethod
+    def validate_joint_angles_deg(cls, angles, context="Lite 6 pose"):
+        """Validate six Lite 6 joint angles against the working ranges."""
+        angles = np.asarray(angles, dtype=float).reshape(-1)
+        if angles.size < 6 or not np.all(np.isfinite(angles[:6])):
+            raise ValueError(f"{context}: expected six finite joint angles.")
+        angles = angles[:6]
+        lower = np.asarray(cls.JOINT_MIN_DEG, dtype=float)
+        upper = np.asarray(cls.JOINT_MAX_DEG, dtype=float)
+        invalid = np.flatnonzero((angles < lower) | (angles > upper))
+        if invalid.size:
+            details = ", ".join(
+                f"J{index + 1}={angles[index]:.3f} deg "
+                f"(allowed {lower[index]:g} to {upper[index]:g})"
+                for index in invalid
+            )
+            raise ValueError(f"{context} exceeds joint limits: {details}")
+        return angles.copy()
+
+    @classmethod
+    def clip_joint_angles_deg(cls, angles):
+        """Clip six joint angles to the configured Lite 6 working ranges."""
+        angles = np.asarray(angles, dtype=float).reshape(-1)
+        if angles.size < 6 or not np.all(np.isfinite(angles[:6])):
+            raise ValueError("Expected six finite Lite 6 joint angles.")
+        return np.clip(
+            angles[:6],
+            np.asarray(cls.JOINT_MIN_DEG, dtype=float),
+            np.asarray(cls.JOINT_MAX_DEG, dtype=float),
+        )
+
+    def get_joint_angles_deg(self):
+        """Read and validate the current six Lite 6 joint angles."""
+        if self.arm is None:
+            raise RuntimeError("Lite 6 is not connected.")
+        code, angles = self.arm.get_servo_angle(is_radian=False)
+        if code != 0:
+            raise RuntimeError(
+                f"Could not read Lite 6 joint angles; error code: {code}"
+            )
+        return self.validate_joint_angles_deg(angles, "Current Lite 6 pose")
 
     def move_to_initial(self, speed_deg_s=20.0, acceleration_deg_s2=200.0):
         """Reset the controller and move to the documented initial joint pose."""

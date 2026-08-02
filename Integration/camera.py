@@ -8,8 +8,8 @@ Script for all the functions for the camera:
 
 from pathlib import Path
 import json
-
-import cv2
+import time
+import cv2 as cv
 import numpy as np
 import pyzed.sl as sl
 import torch
@@ -138,9 +138,9 @@ def get_image(
 
     # ZED images are returned in BGRA format.
     # OpenCV and Detectron2 normally expect BGR.
-    image_bgr = cv2.cvtColor(
+    image_bgr = cv.cvtColor(
         image_bgra,
-        cv2.COLOR_BGRA2BGR,
+        cv.COLOR_BGRA2BGR,
     )
 
     return image_bgr
@@ -342,8 +342,8 @@ def detect_tray(image_bgr, predictor, mask_kernel_size=5):
         (mask_kernel_size, mask_kernel_size),
         dtype=np.uint8,
     )
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kernel)
+    mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel)
     mask = mask > 0
 
     if mask.shape != image_bgr.shape[:2] or not np.any(mask):
@@ -453,7 +453,7 @@ def calculate_tray_centroid(
         return None
 
     mask = np.asarray(tray_mask, dtype=np.uint8)
-    moments = cv2.moments(mask)
+    moments = cv.moments(mask)
     if moments["m00"] <= 0:
         return None
 
@@ -573,3 +573,486 @@ def save_tray_data(
     print(f"[INFO] Tray plane saved to {Path(plane_path).resolve()}")
     print(f"[INFO] Tray centroid saved to {Path(centroid_path).resolve()}")
     return Path(plane_path).resolve(), Path(centroid_path).resolve()
+
+
+# --------------------------------------------------
+# Arm Tracking Functions
+# --------------------------------------------------
+BODY_FORMAT = sl.BODY_FORMAT.BODY_18
+
+# Right arm BODY_18 indices
+RIGHT_SHOULDER = 2
+RIGHT_ELBOW = 3
+RIGHT_WRIST = 4
+
+# Left arm BODY_18 indices
+LEFT_SHOULDER = 5
+LEFT_ELBOW = 6
+LEFT_WRIST = 7
+
+def setup_body_tracking(zed):
+    """
+    Enable BODY_34 body tracking on an already-opened ZED camera.
+
+    Parameters
+    ----------
+    zed : sl.Camera
+        Already opened ZED camera object.
+
+    Returns
+    -------
+    body_runtime : sl.BodyTrackingRuntimeParameters
+        Runtime parameters used by zed.retrieve_bodies(...).
+    """
+
+    # -------------------------------------------------
+    # Create body tracking parameter object
+    # -------------------------------------------------
+
+    body_params = sl.BodyTrackingParameters()
+
+    # -------------------------------------------------
+    # Use the accurate human body tracking model
+    # -------------------------------------------------
+
+    body_params.detection_model = (
+        sl.BODY_TRACKING_MODEL.HUMAN_BODY_ACCURATE
+    )
+
+    # -------------------------------------------------
+    # Enable tracking so the ZED can keep person IDs
+    # consistent between frames
+    # -------------------------------------------------
+
+    body_params.enable_tracking = True
+
+    # -------------------------------------------------
+    # Enable body fitting for smoother skeleton points
+    # -------------------------------------------------
+
+    body_params.enable_body_fitting = True
+
+    # -------------------------------------------------
+    # Use the BODY_34 skeleton format
+    # -------------------------------------------------
+
+    body_params.body_format = BODY_FORMAT
+
+    # -------------------------------------------------
+    # Positional tracking is required for ZED body tracking
+    # -------------------------------------------------
+
+    positional_params = sl.PositionalTrackingParameters()
+
+    err = zed.enable_positional_tracking(positional_params)
+
+    if err != sl.ERROR_CODE.SUCCESS:
+        raise RuntimeError(
+            f"Failed to enable positional tracking: {err}"
+        )
+
+    # -------------------------------------------------
+    # Enable body tracking
+    # -------------------------------------------------
+
+    err = zed.enable_body_tracking(body_params)
+
+    if err != sl.ERROR_CODE.SUCCESS:
+        raise RuntimeError(
+            f"Failed to enable body tracking: {err}"
+        )
+
+    # -------------------------------------------------
+    # Create runtime body tracking parameters
+    # -------------------------------------------------
+
+    body_runtime = sl.BodyTrackingRuntimeParameters()
+
+    # -------------------------------------------------
+    # Ignore low-confidence body detections
+    # -------------------------------------------------
+
+    body_runtime.detection_confidence_threshold = 40
+
+    print("Body tracking enabled.")
+
+    return body_runtime
+
+
+def get_single_body(bodies, mode="closest"):
+    """
+    Select one person from all detected people.
+
+    Parameters
+    ----------
+    bodies : sl.Bodies
+        Body container returned by zed.retrieve_bodies(...).
+
+    mode : str
+        Selection method.
+
+        "closest":
+            Select the detected person closest to the camera.
+
+        "first":
+            Select the first detected person.
+
+    Returns
+    -------
+    body : sl.BodyData or None
+        One selected body.
+
+        Returns None if no bodies are detected.
+    """
+
+    # -------------------------------------------------
+    # If no human is detected, return None
+    # -------------------------------------------------
+
+    if len(bodies.body_list) == 0:
+        print("No detected bodies!")
+        return None
+
+    # -------------------------------------------------
+    # Option 1: use the first detected person
+    # -------------------------------------------------
+
+    if mode == "first":
+        return bodies.body_list[0]
+
+    # -------------------------------------------------
+    # Option 2: use the closest detected person
+    # -------------------------------------------------
+    #
+    # body.position[2] is the depth value.
+    #
+    # Smaller positive z value usually means the person
+    # is closer to the camera.
+    #
+    # -------------------------------------------------
+
+    if mode == "closest":
+        return min(
+            bodies.body_list,
+            key=lambda b: float(b.position[2])
+            if b.position[2] > 0
+            else float("inf")
+        )
+
+    # -------------------------------------------------
+    # Reject invalid selection modes
+    # -------------------------------------------------
+
+    raise ValueError("mode must be 'closest' or 'first'")
+
+def get_arm_indices(arm="right"):
+    """
+    Return BODY_18 indices for the selected arm.
+
+    Parameters
+    ----------
+    arm : str
+        "right" or "left".
+
+    Returns
+    -------
+    shoulder_idx, elbow_idx, wrist_idx : tuple
+        BODY_18 joint indices for the selected arm.
+    """
+
+    # -------------------------------------------------
+    # Normalize user input
+    # -------------------------------------------------
+
+    arm = arm.lower()
+
+    # -------------------------------------------------
+    # Return right arm indices
+    # -------------------------------------------------
+
+    if arm == "right":
+        return RIGHT_SHOULDER, RIGHT_ELBOW, RIGHT_WRIST
+
+    # -------------------------------------------------
+    # Return left arm indices
+    # -------------------------------------------------
+
+    if arm == "left":
+        return LEFT_SHOULDER, LEFT_ELBOW, LEFT_WRIST
+
+    # -------------------------------------------------
+    # Reject invalid arm names
+    # -------------------------------------------------
+
+    raise ValueError("arm must be 'right' or 'left'")
+
+
+def get_arm_points(body, arm="right"):
+    """
+    Extract shoulder, elbow, and wrist points for one arm.
+
+    Parameters
+    ----------
+    body : sl.BodyData
+        One detected person from bodies.body_list.
+
+    arm : str
+        Arm to extract.
+        Options:
+            "right"
+            "left"
+
+    Returns
+    -------
+    arm_data : dict or None
+        Dictionary containing 2D and 3D points.
+
+        Returns None if the selected arm points are invalid.
+    """
+
+    # -------------------------------------------------
+    # Get correct BODY_18 indices
+    # -------------------------------------------------
+
+    shoulder_idx, elbow_idx, wrist_idx = get_arm_indices(arm)
+
+    # -------------------------------------------------
+    # Get 2D pixel keypoints
+    # -------------------------------------------------
+    #
+    # These are used for drawing on the OpenCV image.
+    #
+    # -------------------------------------------------
+
+    keypoints_2d = body.keypoint_2d
+
+    # -------------------------------------------------
+    # Get 3D keypoints
+    # -------------------------------------------------
+    #
+    # These are used for distance calculations and
+    # later robot control.
+    #
+    # -------------------------------------------------
+
+    keypoints_3d = body.keypoint
+
+    # -------------------------------------------------
+    # Check that the selected indices exist
+    # -------------------------------------------------
+
+    max_idx = max(shoulder_idx, elbow_idx, wrist_idx)
+
+    if len(keypoints_2d) <= max_idx:
+        return None
+
+    if len(keypoints_3d) <= max_idx:
+        return None
+
+    # -------------------------------------------------
+    # Extract 2D points
+    # -------------------------------------------------
+
+    shoulder_2d = np.array(keypoints_2d[shoulder_idx], dtype=float)
+    elbow_2d = np.array(keypoints_2d[elbow_idx], dtype=float)
+    wrist_2d = np.array(keypoints_2d[wrist_idx], dtype=float)
+
+    # -------------------------------------------------
+    # Extract 3D points
+    # -------------------------------------------------
+
+    shoulder_3d = np.array(keypoints_3d[shoulder_idx], dtype=float)
+    elbow_3d = np.array(keypoints_3d[elbow_idx], dtype=float)
+    wrist_3d = np.array(keypoints_3d[wrist_idx], dtype=float)
+
+    # -------------------------------------------------
+    # Check 2D points
+    # -------------------------------------------------
+    #
+    # Invalid 2D points are often [0, 0] or negative.
+    #
+    # -------------------------------------------------
+
+    for point in [shoulder_2d, elbow_2d, wrist_2d]:
+        if point[0] <= 0 or point[1] <= 0:
+            return None
+
+    # -------------------------------------------------
+    # Check 3D points
+    # -------------------------------------------------
+    #
+    # Invalid 3D points can contain nan or inf.
+    #
+    # -------------------------------------------------
+
+    for point in [shoulder_3d, elbow_3d, wrist_3d]:
+        if not np.isfinite(point).all():
+            return None
+
+    # -------------------------------------------------
+    # Package arm data
+    # -------------------------------------------------
+
+    arm_data = {
+        "arm": arm,
+
+        "shoulder_2d": shoulder_2d,
+        "elbow_2d": elbow_2d,
+        "wrist_2d": wrist_2d,
+
+        "shoulder_3d": shoulder_3d,
+        "elbow_3d": elbow_3d,
+        "wrist_3d": wrist_3d,
+    }
+
+    return arm_data
+
+
+def get_arm_vectors(body, arm="right"):
+    """
+    Return the three 3D arm vectors for a ZED BODY_18 skeleton.
+
+    Vector direction follows the joint order in each name:
+
+        shoulder_to_elbow = elbow - shoulder
+        elbow_to_wrist = wrist - elbow
+        shoulder_to_wrist = wrist - shoulder
+
+    Parameters
+    ----------
+    body : sl.BodyData
+        One detected person from bodies.body_list.
+
+    arm : str
+        Arm to use: "right" or "left".
+
+    Returns
+    -------
+    shoulder_to_elbow, elbow_to_wrist, shoulder_to_wrist : tuple
+        Three NumPy arrays of shape (3,), in the ZED camera coordinate
+        frame and the configured ZED units (meters in this module).
+
+        Returns (None, None, None) if get_arm_points(...) cannot produce
+        valid shoulder, elbow, and wrist points.
+    """
+
+    arm_data = get_arm_points(body, arm)
+
+    if arm_data is None:
+        return None, None, None
+
+    shoulder = arm_data["shoulder_3d"]
+    elbow = arm_data["elbow_3d"]
+    wrist = arm_data["wrist_3d"]
+
+    shoulder_to_elbow = elbow - shoulder
+    elbow_to_wrist = wrist - elbow
+    shoulder_to_wrist = wrist - shoulder
+
+    return shoulder_to_elbow, elbow_to_wrist, shoulder_to_wrist
+
+
+def draw_arm_points_and_lines(image, arm_data):
+    """
+    Draw shoulder, elbow, and wrist on an OpenCV image.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        OpenCV image.
+
+    arm_data : dict or None
+        Output from get_arm_points(...).
+
+    Returns
+    -------
+    image : np.ndarray
+        Image with arm overlay.
+    """
+
+    # -------------------------------------------------
+    # If arm data is invalid, return image unchanged
+    # -------------------------------------------------
+
+    if arm_data is None:
+        return image
+
+    # -------------------------------------------------
+    # Extract 2D points
+    # -------------------------------------------------
+
+    shoulder = arm_data["shoulder_2d"]
+    elbow = arm_data["elbow_2d"]
+    wrist = arm_data["wrist_2d"]
+
+    # -------------------------------------------------
+    # Convert float pixel coordinates to integer pixels
+    # -------------------------------------------------
+
+    shoulder = (int(shoulder[0]), int(shoulder[1]))
+    elbow = (int(elbow[0]), int(elbow[1]))
+    wrist = (int(wrist[0]), int(wrist[1]))
+
+    # -------------------------------------------------
+    # Draw arm links first
+    # -------------------------------------------------
+
+    cv.line(image, shoulder, elbow, (0, 255, 255), 3)
+    cv.line(image, elbow, wrist, (0, 255, 255), 3)
+
+    # -------------------------------------------------
+    # Draw arm joints
+    # -------------------------------------------------
+
+    cv.circle(image, shoulder, 7, (0, 255, 0), -1)
+    cv.circle(image, elbow, 7, (0, 255, 0), -1)
+    cv.circle(image, wrist, 7, (0, 255, 0), -1)
+
+    # -------------------------------------------------
+    # Label joints
+    # -------------------------------------------------
+
+    cv.putText(
+        image,
+        "Shoulder",
+        (shoulder[0] + 10, shoulder[1] - 10),
+        cv.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (0, 255, 0),
+        2
+    )
+
+    cv.putText(
+        image,
+        "Elbow",
+        (elbow[0] + 10, elbow[1] - 10),
+        cv.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (0, 255, 0),
+        2
+    )
+
+    cv.putText(
+        image,
+        "Wrist",
+        (wrist[0] + 10, wrist[1] - 10),
+        cv.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (0, 255, 0),
+        2
+    )
+
+    return image
+
+def get_arm_length(shoulder_pos, wrist_pos):
+    """
+    Compute shoulder-to-hand arm length using full 3D distance.
+
+    For BODY_18:
+        shoulder -> wrist
+    """
+
+    shoulder_pos = np.asarray(shoulder_pos, dtype=float).reshape(3)
+    wrist_pos = np.asarray(wrist_pos, dtype=float).reshape(3)
+
+    return np.linalg.norm(wrist_pos - shoulder_pos)

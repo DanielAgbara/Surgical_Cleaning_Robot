@@ -55,10 +55,20 @@ def load_T_base_camera(path):
     with open(path, "r", encoding="utf-8") as file:
         data = json.load(file)
 
-    transform_value = data.get("T_base_camera", data.get("T_base_cam"))
+    if "data" in data:
+        names = data.get("description", {}).get("axis_0_order", [])
+        try:
+            transform_index = names.index("T_base_camera")
+        except ValueError:
+            transform_value = None
+        else:
+            transform_value = data["data"][transform_index]
+    else:
+        transform_value = data.get("T_base_camera", data.get("T_base_cam"))
+
     if transform_value is None:
         raise ValueError(
-            f"{path} must contain 'T_base_camera' or 'T_base_cam'."
+            f"{path} must describe a T_base_camera transform."
         )
 
     transform = np.asarray(transform_value, dtype=float)
