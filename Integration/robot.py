@@ -8,7 +8,7 @@ from typing import Callable
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 from dataclasses import dataclass
 from pathlib import Path
-import force_sensing, warnings, sys
+import warnings, sys
 
 # --------------------------------------------------
 # SO3 Functions
@@ -1813,14 +1813,35 @@ class SOArm101:
 class Lite6:
     """Small UFACTORY Lite 6 adapter used by the integration pipeline."""
 
+    DEFAULT_IP_ADDRESS = "192.168.1.184"
+    DEFAULT_SPEED_PERCENT = 20.0
+    MAX_JOINT_SPEED_DEG_S = 180.0
     # UFACTORY Studio's documented Lite 6 "Initial Position" in degrees.
     INITIAL_JOINT_ANGLES_DEG = (0.0, 9.9, 31.8, 0.0, 21.9, 0.0)
     JOINT_MIN_DEG = (-360.0, -150.0, -3.5, -360.0, -124.0, -360.0)
     JOINT_MAX_DEG = (360.0, 150.0, 300.0, 360.0, 124.0, 360.0)
 
-    def __init__(self, ip_address):
+    def __init__(self, ip_address=DEFAULT_IP_ADDRESS, speed_percent=DEFAULT_SPEED_PERCENT):
         self.ip_address = str(ip_address)
+        self.speed_percent = self.validate_speed_percent(speed_percent)
         self.arm = None
+
+    @staticmethod
+    def validate_speed_percent(speed_percent):
+        """Validate a commanded Lite 6 speed percentage."""
+        speed_percent = float(speed_percent)
+        if not np.isfinite(speed_percent) or not 0.0 < speed_percent <= 100.0:
+            raise ValueError("Lite 6 speed percentage must be in (0, 100].")
+        return speed_percent
+
+    @classmethod
+    def speed_percent_to_deg_s(cls, speed_percent):
+        """Convert percent of the 180 deg/s joint-speed reference to deg/s."""
+        return (
+            cls.validate_speed_percent(speed_percent)
+            * cls.MAX_JOINT_SPEED_DEG_S
+            / 100.0
+        )
 
     @staticmethod
     def T_mm_to_meters(T_mm):
@@ -1938,26 +1959,31 @@ class Lite6:
             )
         return self.validate_joint_angles_deg(angles, "Current Lite 6 pose")
 
-    def move_to_initial(self, speed_deg_s=20.0, acceleration_deg_s2=200.0):
-        """Reset the controller and move to the documented initial joint pose."""
-        if speed_deg_s <= 0:
-            raise ValueError("speed_deg_s must be positive.")
-        if acceleration_deg_s2 <= 0:
-            raise ValueError("acceleration_deg_s2 must be positive.")
-
-        self.reset_state()
+    def move_to_joint_angles(self, angles_deg, speed_percent=None, wait=True):
+        """Move to a validated six-joint target at a percentage speed."""
+        if self.arm is None:
+            raise RuntimeError("Lite 6 is not connected.")
+        angles = self.validate_joint_angles_deg(angles_deg, "Lite 6 target")
+        percent = self.speed_percent if speed_percent is None else speed_percent
+        speed_deg_s = self.speed_percent_to_deg_s(percent)
         code = self.arm.set_servo_angle(
-            angle=list(self.INITIAL_JOINT_ANGLES_DEG),
-            speed=float(speed_deg_s),
-            mvacc=float(acceleration_deg_s2),
-            wait=True,
+            angle=angles.tolist(),
+            speed=speed_deg_s,
+            wait=bool(wait),
             is_radian=False,
         )
         if code != 0:
             raise RuntimeError(
-                "Could not move the Lite 6 to its initial position; "
-                f"error code: {code}"
+                f"Lite 6 joint move failed with error code {code}"
             )
+
+    def move_to_initial(self, speed_percent=None):
+        """Reset the controller and move to the documented initial joint pose."""
+        self.reset_state()
+        self.move_to_joint_angles(
+            self.INITIAL_JOINT_ANGLES_DEG,
+            speed_percent=speed_percent,
+        )
 
     def enter_manual_mode(self):
         """Enter Mode 2 free-drive after restoring a known controller state."""
