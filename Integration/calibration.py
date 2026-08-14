@@ -95,6 +95,14 @@ DEFAULT_CHARUCO_CONFIG = CharucoBoardConfig(
     marker_length_m=0.0361,
     dictionary_id=cv2.aruco.DICT_4X4_50,
 )
+
+HUMAN_TOOL_CHARUCO_CONFIG = CharucoBoardConfig(
+    squares_x=3,
+    squares_y=3,
+    square_length_m=0.032,
+    marker_length_m=0.0258,
+    dictionary_id=cv2.aruco.DICT_4X4_50,
+)
         
 
 def create_charuco_detector(
@@ -492,8 +500,11 @@ def estimate_charuco_pose(
         ),
     )
 
-def generateCharucoPDF():
-    """Generate a printable PDF from ``DEFAULT_CHARUCO_CONFIG``.
+def generateCharucoPDF(
+    config=DEFAULT_CHARUCO_CONFIG,
+    name=None,
+):
+    """Generate a printable PDF from a ChArUco board configuration.
 
     Returns
     -------
@@ -503,7 +514,7 @@ def generateCharucoPDF():
     Notes
     -----
     All board geometry, marker sizing, dictionary selection, and legacy
-    pattern behavior are taken from ``DEFAULT_CHARUCO_CONFIG``.
+    pattern behavior are taken from ``config``.
     """
     try:
         from PIL import Image
@@ -512,7 +523,6 @@ def generateCharucoPDF():
             "Pillow is required to create the PDF: pip install Pillow"
         ) from exc
 
-    config = DEFAULT_CHARUCO_CONFIG
     config.validate()
 
     square_length_mm = config.square_length_m * 1000.0
@@ -549,9 +559,10 @@ def generateCharucoPDF():
     size_label = f"{width_mm:g}x{height_mm:g}mm"
     board_directory = Path(__file__).resolve().parent / "data" / "charuco_boards"
     board_directory.mkdir(parents=True, exist_ok=True)
+    name_prefix = "" if name is None else f"{name}_"
     pdf_path = (
         board_directory
-        / f"charuco_{config.squares_x}x{config.squares_y}_{size_label}.pdf"
+        / f"charuco_{name_prefix}{config.squares_x}x{config.squares_y}_{size_label}.pdf"
     )
     Image.fromarray(board_image).convert("L").save(
         pdf_path, "PDF", resolution=dpi
@@ -2489,7 +2500,13 @@ def main():
     parser = argparse.ArgumentParser(description="Robot eye-hand calibration")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    commands.add_parser("pdf", help="Generate the printable ChArUco board")
+    pdf = commands.add_parser("pdf", help="Generate a printable ChArUco board")
+    pdf.add_argument(
+        "--board",
+        choices=("calibration", "human-tool"),
+        default="calibration",
+        help="Board design to generate, default: calibration",
+    )
 
     create = commands.add_parser(
         "create",
@@ -2572,7 +2589,10 @@ def main():
     args = parser.parse_args()
 
     if args.command == "pdf":
-        generateCharucoPDF()
+        if args.board == "human-tool":
+            generateCharucoPDF(HUMAN_TOOL_CHARUCO_CONFIG, "human_tool")
+        else:
+            generateCharucoPDF(DEFAULT_CHARUCO_CONFIG)
     elif args.command == "create":
         if args.robot == "lite6":
             if not args.ip:

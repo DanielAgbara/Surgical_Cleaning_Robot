@@ -23,8 +23,8 @@ from detectron2.engine import DefaultPredictor
 # ZED Camera Functions
 # --------------------------------------------------
 
-ZED_RESOLUTION = sl.RESOLUTION.HD2K
-ZED_FPS = 15
+ZED_RESOLUTION = sl.RESOLUTION.HD1080
+ZED_FPS = 30
 ZED_UNITS = sl.UNIT.METER
 ZED_DEPTH = sl.DEPTH_MODE.NEURAL_PLUS
 
