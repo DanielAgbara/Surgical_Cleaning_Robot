@@ -7,9 +7,10 @@ Public transform API
 camera image. ``get_T_marker_cleaning_head`` loads the fixed transform from the
 marker to the cleaning-head center.
 
-Force calibration and reading live in force_sensor.py so robot and human
-sensors share one calibration schema and serial interface. This launcher
-inserts the human target into its canonical command line:
+Force calibration and conversion live in force_sensor.py so robot and human
+sensors share one calibration schema and serial interface. This module also
+provides timestamped background acquisition and scalar One Euro filtering for
+Phase 2. The launcher inserts the human target into its canonical command line:
 
     human.py calibrate  ->  force_sensor.py calibrate human
     human.py read       ->  force_sensor.py read human
@@ -18,7 +19,8 @@ inserts the human target into its canonical command line:
 import sys
 import time
 import argparse
-from collections import Counter
+import threading
+from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -113,6 +115,301 @@ class PoseFilterConfig:
             raise ValueError("Pose-filter cutoffs must be finite and positive")
         if not all(np.isfinite(value) and value >= 0.0 for value in betas):
             raise ValueError("Pose-filter beta values must be finite and nonnegative")
+
+
+@dataclass(frozen=True)
+class ForceFilterConfig:
+    """One Euro filter parameters for the scalar human force signal."""
+
+    min_cutoff_hz: float = 2.0
+    beta: float = 0.05
+    derivative_cutoff_hz: float = 1.0
+
+    def validate(self) -> None:
+        if not all(
+            np.isfinite(value) and value > 0.0
+            for value in (self.min_cutoff_hz, self.derivative_cutoff_hz)
+        ):
+            raise ValueError("Force-filter cutoffs must be finite and positive")
+        if not np.isfinite(self.beta) or self.beta < 0.0:
+            raise ValueError("Force-filter beta must be finite and nonnegative")
+
+
+@dataclass(frozen=True)
+class TimestampedForceSample:
+    """One raw and filtered force reading on the host monotonic clock."""
+
+    timestamp_s: float
+    raw_adc: float
+    raw_force_newtons: float
+    filtered_force_newtons: float
+    arduino_millis: int
+    sample_counter: int
+
+
+@dataclass(frozen=True)
+class SynchronizedForceSample:
+    """Force interpolated or selected at a camera measurement timestamp."""
+
+    timestamp_s: float
+    source_timestamp_s: float
+    age_s: float
+    raw_adc: float
+    raw_force_newtons: float
+    filtered_force_newtons: float
+    interpolated: bool
+
+
+class ForceOneEuroFilter:
+    """Timestamp-aware One Euro filter for a scalar force signal."""
+
+    def __init__(self, config: ForceFilterConfig | None = None) -> None:
+        self.config = config or ForceFilterConfig()
+        self.config.validate()
+        self.reset()
+
+    def reset(self) -> None:
+        self.previous_timestamp = None
+        self.previous_value = None
+        self.previous_derivative = 0.0
+
+    def update(self, value: float, timestamp_s: float) -> float:
+        value = float(value)
+        timestamp_s = float(timestamp_s)
+        if not np.isfinite(value) or not np.isfinite(timestamp_s):
+            raise ValueError("Force value and timestamp must be finite")
+        if self.previous_timestamp is None:
+            filtered = value
+        else:
+            elapsed = timestamp_s - self.previous_timestamp
+            if elapsed <= 0.0:
+                raise ValueError("Force-filter timestamps must increase")
+            derivative = (value - self.previous_value) / elapsed
+            derivative_alpha = _low_pass_alpha(
+                self.config.derivative_cutoff_hz, elapsed
+            )
+            filtered_derivative = (
+                derivative_alpha * derivative
+                + (1.0 - derivative_alpha) * self.previous_derivative
+            )
+            cutoff = (
+                self.config.min_cutoff_hz
+                + self.config.beta * abs(filtered_derivative)
+            )
+            alpha = _low_pass_alpha(cutoff, elapsed)
+            filtered = alpha * value + (1.0 - alpha) * self.previous_value
+            self.previous_derivative = filtered_derivative
+        self.previous_timestamp = timestamp_s
+        self.previous_value = float(filtered)
+        return float(filtered)
+
+
+class HumanForceSampler:
+    """Acquire human force continuously without blocking camera tracking."""
+
+    def __init__(
+        self,
+        calibration_file: Path,
+        port: str = "/dev/ttyUSB0",
+        baud: int = 115200,
+        filter_config: ForceFilterConfig | None = None,
+        buffer_seconds: float = 2.0,
+    ) -> None:
+        if not np.isfinite(buffer_seconds) or buffer_seconds <= 0.0:
+            raise ValueError("Force buffer duration must be positive")
+        from force_sensor import ForceSensor
+
+        self.calibration_file = Path(calibration_file).expanduser().resolve()
+        self.sensor = ForceSensor(port=port, baudrate=baud)
+        self.filter = ForceOneEuroFilter(filter_config)
+        self.buffer_seconds = float(buffer_seconds)
+        self._samples = deque()
+        self._recorded_samples = []
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._sample_event = threading.Event()
+        self._thread = None
+        self._error = None
+
+    def start(self, session_zero: bool = False, zero_samples: int = 100) -> None:
+        if self._thread is not None:
+            raise RuntimeError("Human force sampler is already running")
+        if not self.calibration_file.exists():
+            raise FileNotFoundError(
+                f"Human force calibration not found: {self.calibration_file}"
+            )
+        self.sensor.connect()
+        try:
+            self.sensor.load_calibration(self.calibration_file)
+            if session_zero:
+                self.sensor.tare(zero_samples)
+            self._thread = threading.Thread(
+                target=self._acquire,
+                name="human-force-sampler",
+                daemon=True,
+            )
+            self._thread.start()
+            if not self._sample_event.wait(timeout=3.0):
+                self._raise_background_error()
+                raise TimeoutError("Timed out waiting for the first force sample")
+        except Exception:
+            self.close()
+            raise
+
+    def _acquire(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                sample = self.sensor.read(timeout_seconds=2.0)
+                timestamp = sample.host_monotonic_time
+                filtered = self.filter.update(sample.force_newtons, timestamp)
+                synchronized = TimestampedForceSample(
+                    timestamp_s=timestamp,
+                    raw_adc=sample.raw_adc,
+                    raw_force_newtons=sample.force_newtons,
+                    filtered_force_newtons=filtered,
+                    arduino_millis=sample.arduino_millis,
+                    sample_counter=sample.sample_counter,
+                )
+                with self._lock:
+                    self._samples.append(synchronized)
+                    self._recorded_samples.append(synchronized)
+                    cutoff = timestamp - self.buffer_seconds
+                    while self._samples and self._samples[0].timestamp_s < cutoff:
+                        self._samples.popleft()
+                self._sample_event.set()
+        except Exception as error:
+            if not self._stop_event.is_set():
+                self._error = error
+                self._sample_event.set()
+
+    def _raise_background_error(self) -> None:
+        if self._error is not None:
+            raise RuntimeError("Human force acquisition stopped") from self._error
+
+    def sample_at(
+        self,
+        timestamp_s: float,
+        max_age_s: float = 0.050,
+    ) -> SynchronizedForceSample | None:
+        """Return force aligned to a host-monotonic camera timestamp."""
+        self._raise_background_error()
+        timestamp_s = float(timestamp_s)
+        if (
+            not np.isfinite(timestamp_s)
+            or not np.isfinite(max_age_s)
+            or max_age_s <= 0.0
+        ):
+            raise ValueError("Force synchronization time and age must be valid")
+        with self._lock:
+            samples = list(self._samples)
+        if not samples:
+            return None
+
+        right_index = next(
+            (index for index, item in enumerate(samples)
+             if item.timestamp_s >= timestamp_s),
+            len(samples),
+        )
+        if 0 < right_index < len(samples):
+            left = samples[right_index - 1]
+            right = samples[right_index]
+            span = right.timestamp_s - left.timestamp_s
+            fraction = (timestamp_s - left.timestamp_s) / span
+            age = min(
+                timestamp_s - left.timestamp_s,
+                right.timestamp_s - timestamp_s,
+            )
+            if age > max_age_s:
+                return None
+            return SynchronizedForceSample(
+                timestamp_s=timestamp_s,
+                source_timestamp_s=timestamp_s,
+                age_s=float(age),
+                raw_adc=float(left.raw_adc + fraction * (right.raw_adc - left.raw_adc)),
+                raw_force_newtons=float(
+                    left.raw_force_newtons
+                    + fraction * (right.raw_force_newtons - left.raw_force_newtons)
+                ),
+                filtered_force_newtons=float(
+                    left.filtered_force_newtons
+                    + fraction
+                    * (right.filtered_force_newtons - left.filtered_force_newtons)
+                ),
+                interpolated=True,
+            )
+
+        nearest = samples[0] if right_index == 0 else samples[-1]
+        age = abs(timestamp_s - nearest.timestamp_s)
+        if age > max_age_s:
+            return None
+        return SynchronizedForceSample(
+            timestamp_s=timestamp_s,
+            source_timestamp_s=nearest.timestamp_s,
+            age_s=float(age),
+            raw_adc=nearest.raw_adc,
+            raw_force_newtons=nearest.raw_force_newtons,
+            filtered_force_newtons=nearest.filtered_force_newtons,
+            interpolated=False,
+        )
+
+    def recorded_samples(self) -> list[TimestampedForceSample]:
+        """Return a stable copy of the complete native-rate force stream."""
+        self._raise_background_error()
+        with self._lock:
+            return list(self._recorded_samples)
+
+    @staticmethod
+    def interpolate_recorded_sample(
+        samples: list[TimestampedForceSample],
+        timestamp_s: float,
+    ) -> SynchronizedForceSample | None:
+        """Interpolate a completed force stream at one camera timestamp."""
+        if not samples:
+            return None
+        timestamps = np.asarray([sample.timestamp_s for sample in samples])
+        if timestamp_s < timestamps[0] or timestamp_s > timestamps[-1]:
+            return None
+        right_index = int(np.searchsorted(timestamps, timestamp_s, side="left"))
+        if right_index == 0:
+            left = right = samples[0]
+        elif right_index == len(samples):
+            left = right = samples[-1]
+        else:
+            left = samples[right_index - 1]
+            right = samples[right_index]
+        if left.timestamp_s == right.timestamp_s:
+            fraction = 0.0
+        else:
+            fraction = (
+                (timestamp_s - left.timestamp_s)
+                / (right.timestamp_s - left.timestamp_s)
+            )
+        nearest_age = min(
+            abs(timestamp_s - left.timestamp_s),
+            abs(right.timestamp_s - timestamp_s),
+        )
+
+        def interpolate(attribute: str) -> float:
+            left_value = float(getattr(left, attribute))
+            right_value = float(getattr(right, attribute))
+            return left_value + fraction * (right_value - left_value)
+
+        return SynchronizedForceSample(
+            timestamp_s=float(timestamp_s),
+            source_timestamp_s=float(timestamp_s),
+            age_s=float(nearest_age),
+            raw_adc=interpolate("raw_adc"),
+            raw_force_newtons=interpolate("raw_force_newtons"),
+            filtered_force_newtons=interpolate("filtered_force_newtons"),
+            interpolated=left is not right,
+        )
+
+    def close(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.5)
+            self._thread = None
+        self.sensor.disconnect()
 
 
 @dataclass(frozen=True)

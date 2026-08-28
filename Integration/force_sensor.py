@@ -9,14 +9,19 @@ What this program does
 ----------------------
 1. Opens /dev/ttyUSB0 at 115200 baud.
 2. Receives raw HX711 readings from the Arduino.
-3. Runs fixed-pose scale calibration using a known mass.
+3. Runs scale calibration using one weight for the robot sensor or multiple
+   weights for the human sensor.
 4. Moves through unloaded Lite6 poses and fits a gravity model.
-5. Saves scale, gravity, payload, and fit-quality calibration values.
-6. In test mode, streams gravity-compensated contact force until Ctrl+C.
+5. Saves scale and fit-quality values, plus robot gravity/payload values.
+6. Streams calibrated force until Ctrl+C; robot readings are additionally
+   gravity compensated.
 
 Calibration convention
 ----------------------
 counts_per_newton = (loaded_adc - tare_offset) / known_force_newtons
+
+For human calibration, the same relationship is fitted by least squares over
+the zero-load reading and every supplied calibration weight.
 
 Therefore:
 force_newtons = (raw_adc - tare_offset) / counts_per_newton
@@ -76,7 +81,7 @@ DEFAULT_CALIBRATION_FILE = FORCE_DATA_DIR / "force_sensor_calibration.json"
 DEFAULT_HUMAN_CALIBRATION_FILE = (
     FORCE_DATA_DIR / "human_force_sensor_calibration.json"
 )
-HUMAN_GRAVITY_DATA_FILE = FORCE_DATA_DIR / "human_gravity_calibration.json"
+HUMAN_WEIGHT_DATA_FILE = FORCE_DATA_DIR / "human_weight_calibration.json"
 
 
 @dataclass(frozen=True)
@@ -99,13 +104,14 @@ class Calibration:
     counts_per_newton: float
     tare_offset: float = 0.0
     known_mass_kg: float | None = None
+    known_masses_kg: list[float] | None = None
+    scale_fit_rmse_newtons: float | None = None
     saved_unix_time: float | None = None
     adc_intercept: float | None = None
     gravity_coefficients: list[float] | None = None
     estimated_payload_mass_kg: float | None = None
     gravity_fit_rmse_newtons: float | None = None
     gravity_calibration_poses: int | None = None
-    orientation_coefficients: list[float] | None = None
 
     def validate(self) -> None:
         if (
@@ -113,45 +119,27 @@ class Calibration:
             or abs(self.counts_per_newton) < 1e-12
         ):
             raise ValueError("counts_per_newton must be finite and nonzero")
+        if self.known_masses_kg is not None:
+            masses = np.asarray(self.known_masses_kg, dtype=float)
+            if masses.ndim != 1 or masses.size < 2 or np.any(masses <= 0.0):
+                raise ValueError("known_masses_kg must contain positive weights")
+            if not np.all(np.isfinite(masses)):
+                raise ValueError("known_masses_kg must contain finite weights")
+        if self.scale_fit_rmse_newtons is not None and (
+            not np.isfinite(self.scale_fit_rmse_newtons)
+            or self.scale_fit_rmse_newtons < 0.0
+        ):
+            raise ValueError("scale_fit_rmse_newtons must be finite and nonnegative")
         if self.gravity_coefficients is not None:
             coefficients = np.asarray(self.gravity_coefficients, dtype=float)
             if coefficients.shape != (3,) or not np.all(np.isfinite(coefficients)):
                 raise ValueError("gravity_coefficients must contain 3 finite values")
             if self.adc_intercept is None or not np.isfinite(self.adc_intercept):
                 raise ValueError("adc_intercept is required by the gravity model")
-        if self.orientation_coefficients is not None:
-            coefficients = np.asarray(self.orientation_coefficients, dtype=float)
-            if coefficients.shape != (9,) or not np.all(np.isfinite(coefficients)):
-                raise ValueError(
-                    "orientation_coefficients must contain 9 finite values"
-                )
-            if self.adc_intercept is None or not np.isfinite(self.adc_intercept):
-                raise ValueError("adc_intercept is required by the orientation model")
 
     @property
     def has_gravity_model(self) -> bool:
         return self.adc_intercept is not None and self.gravity_coefficients is not None
-
-    @property
-    def has_orientation_model(self) -> bool:
-        return (
-            self.adc_intercept is not None
-            and self.orientation_coefficients is not None
-        )
-
-    def predict_unloaded_adc_from_rotation(
-        self,
-        rotation_camera_marker: np.ndarray,
-    ) -> float:
-        """Predict unloaded human-tool ADC from its ChArUco orientation."""
-        self.validate()
-        if not self.has_orientation_model:
-            raise RuntimeError("Calibration does not contain an orientation model")
-        rotation = np.asarray(rotation_camera_marker, dtype=float).reshape(3, 3)
-        return float(
-            self.adc_intercept
-            + np.asarray(self.orientation_coefficients) @ rotation.reshape(9)
-        )
 
     def predict_unloaded_adc(self, T_base_to_ee: np.ndarray) -> float:
         """Predict the raw ADC value caused by bias and payload gravity."""
@@ -560,6 +548,16 @@ class ForceSensor:
                 if data.get("known_mass_kg") is None
                 else float(data["known_mass_kg"])
             ),
+            known_masses_kg=(
+                None
+                if data.get("known_masses_kg") is None
+                else [float(value) for value in data["known_masses_kg"]]
+            ),
+            scale_fit_rmse_newtons=(
+                None
+                if data.get("scale_fit_rmse_newtons") is None
+                else float(data["scale_fit_rmse_newtons"])
+            ),
             saved_unix_time=(
                 None
                 if data.get("saved_unix_time") is None
@@ -589,11 +587,6 @@ class ForceSensor:
                 None
                 if data.get("gravity_calibration_poses") is None
                 else int(data["gravity_calibration_poses"])
-            ),
-            orientation_coefficients=(
-                None
-                if data.get("orientation_coefficients") is None
-                else [float(value) for value in data["orientation_coefficients"]]
             ),
         )
         calibration.validate()
@@ -905,15 +898,18 @@ def parse_args() -> argparse.Namespace:
     human_calibrate.add_argument(
         "--calibration-file", type=Path, default=DEFAULT_HUMAN_CALIBRATION_FILE
     )
-    human_calibrate.add_argument("--known-mass-kg", type=float, default=0.200)
     human_calibrate.add_argument(
-        "--orientations",
-        type=int,
-        default=15,
-        help="Number of manually held unloaded orientations, default: 15",
+        "--known-masses-kg",
+        type=float,
+        nargs="+",
+        required=True,
+        help=(
+            "Two or more known calibration masses in kg, for example: "
+            "--known-masses-kg 0.05 0.10 0.20"
+        ),
     )
     human_calibrate.add_argument(
-        "--gravity-data-file", type=Path, default=HUMAN_GRAVITY_DATA_FILE
+        "--weight-data-file", type=Path, default=HUMAN_WEIGHT_DATA_FILE
     )
 
     read_parser = commands.add_parser(
@@ -948,7 +944,7 @@ def parse_args() -> argparse.Namespace:
     human_read.add_argument(
         "--session-zero",
         action="store_true",
-        help="Measure an unloaded ADC correction at the current orientation",
+        help="Retare the unloaded sensor for this session",
     )
     return parser.parse_args()
 
@@ -1028,221 +1024,98 @@ def fit_gravity_model(
     calibration.validate()
 
 
-def fit_human_orientation_model(
+def fit_human_weight_model(
     calibration: Calibration,
-    rotations_camera_marker: np.ndarray,
+    masses_kg: np.ndarray,
     raw_adc_values: np.ndarray,
 ) -> None:
-    """Fit unloaded ADC directly from the observed ChArUco orientation."""
-    rotations = np.asarray(rotations_camera_marker, dtype=float).reshape(-1, 9)
+    """Fit human-sensor offset and scale from several known weights."""
+    masses = np.asarray(masses_kg, dtype=float).reshape(-1)
     readings = np.asarray(raw_adc_values, dtype=float).reshape(-1)
-    if rotations.shape[0] != readings.size:
-        raise ValueError("Human orientation and ADC sample counts do not match")
-    design = np.column_stack([np.ones(readings.size), rotations])
+    if masses.size != readings.size or masses.size < 3:
+        raise ValueError("Tare plus at least two weight readings are required")
+    if not np.all(np.isfinite(masses)) or np.any(masses < 0.0):
+        raise ValueError("Calibration masses must be finite and nonnegative")
+    if np.unique(masses).size < 3:
+        raise ValueError("Use at least two distinct positive calibration weights")
+
+    forces = masses * STANDARD_GRAVITY
+    design = np.column_stack([np.ones(forces.size), forces])
     coefficients, _, rank, _ = np.linalg.lstsq(design, readings, rcond=None)
-    if rank < 10:
-        raise RuntimeError(
-            "Human gravity fit is rank deficient. Repeat calibration with "
-            "more varied pitch, roll, and yaw orientations."
-        )
+    if rank < 2 or abs(coefficients[1]) < 1e-12:
+        raise RuntimeError("Weight calibration could not determine sensor scale")
 
     predicted = design @ coefficients
-    residual_newtons = (readings - predicted) / calibration.counts_per_newton
-    orientation_matrix = coefficients[1:].reshape(3, 3)
-    calibration.adc_intercept = float(coefficients[0])
+    calibration.tare_offset = float(coefficients[0])
+    calibration.counts_per_newton = float(coefficients[1])
+    calibration.known_mass_kg = None
+    calibration.known_masses_kg = masses[masses > 0.0].tolist()
+    calibration.scale_fit_rmse_newtons = float(
+        np.sqrt(np.mean(np.square(readings - predicted)))
+        / abs(calibration.counts_per_newton)
+    )
+    calibration.adc_intercept = None
     calibration.gravity_coefficients = None
-    calibration.orientation_coefficients = coefficients[1:].tolist()
-    calibration.estimated_payload_mass_kg = float(
-        np.linalg.svd(orientation_matrix, compute_uv=False)[0]
-        / (abs(calibration.counts_per_newton) * STANDARD_GRAVITY)
-    )
-    calibration.gravity_fit_rmse_newtons = float(
-        np.sqrt(np.mean(np.square(residual_newtons)))
-    )
-    calibration.gravity_calibration_poses = int(readings.size)
+    calibration.estimated_payload_mass_kg = None
+    calibration.gravity_fit_rmse_newtons = None
+    calibration.gravity_calibration_poses = None
     calibration.saved_unix_time = time.time()
     calibration.validate()
 
 
-def open_human_charuco_tracker():
-    """Open the ZED and create the 100 mm, 3x3 human-tool tracker."""
-    import cv2
-
-    from calibration import CharucoBoardConfig, create_charuco_detector
-    from camera import get_zed_left_intrinsics_rectified, open_zed
-
-    config = CharucoBoardConfig(
-        squares_x=3,
-        squares_y=3,
-        square_length_m=0.100 / 3.0,
-        marker_length_m=0.027,
-        dictionary_id=cv2.aruco.DICT_4X4_50,
-    )
-    zed, runtime_params, image_zed = open_zed()
-    camera_matrix, dist_coeffs = get_zed_left_intrinsics_rectified(zed)
-    board, detector = create_charuco_detector(
-        config, camera_matrix, dist_coeffs
-    )
-    return (
-        zed,
-        runtime_params,
-        image_zed,
-        camera_matrix,
-        dist_coeffs,
-        board,
-        detector,
-        config,
-    )
-
-
-def detect_human_marker_pose(
-    image,
-    board,
-    detector,
-    camera_matrix,
-    dist_coeffs,
-):
-    """Detect and draw the human-tool ChArUco board in one ZED frame."""
-    import cv2
-
-    from calibration import detect_charuco_board, estimate_charuco_pose
-
-    detection = detect_charuco_board(image, board, detector)
-    pose = estimate_charuco_pose(
-        detection, board, camera_matrix, dist_coeffs
-    )
-    display = image.copy()
-    if detection.marker_ids is not None:
-        cv2.aruco.drawDetectedMarkers(
-            display, detection.marker_corners, detection.marker_ids
-        )
-    if detection.charuco_ids is not None:
-        cv2.aruco.drawDetectedCornersCharuco(
-            display, detection.charuco_corners, detection.charuco_ids
-        )
-    if pose is not None:
-        cv2.drawFrameAxes(
-            display,
-            camera_matrix,
-            dist_coeffs,
-            pose.rotation_vector,
-            pose.translation_vector,
-            0.025,
-        )
-    return pose, detection, display
-
-
 def run_human_calibration(args: argparse.Namespace) -> None:
-    """Calibrate scale and gravity response from manually held tool poses."""
+    """Calibrate the human sensor from several known weights."""
     if args.samples <= 0:
         raise ValueError("--samples must be positive")
-    if args.known_mass_kg <= 0.0:
-        raise ValueError("--known-mass-kg must be positive")
-    if args.orientations < 10:
-        raise ValueError("--orientations must be at least 10")
-
-    import cv2
-
-    from camera import get_image
+    masses = np.asarray(args.known_masses_kg, dtype=float)
+    if masses.size < 2 or not np.all(np.isfinite(masses)):
+        raise ValueError("--known-masses-kg requires at least two finite values")
+    if np.any(masses <= 0.0) or np.unique(masses).size != masses.size:
+        raise ValueError("Human calibration masses must be positive and distinct")
+    masses.sort()
 
     sensor: ForceSensor | None = None
-    zed = None
-    window_name = "Human force gravity calibration"
-    rotations: list[np.ndarray] = []
     raw_values: list[float] = []
     records: list[dict] = []
     try:
         sensor = connect_sensor(args)
         input(
-            "\nHold the tool in its normal working orientation with no "
-            "external contact. Let it settle, then press Enter to tare..."
+            "\nRemove all weights and external contact. Keep the sensor in "
+            "the same working position used for every weight, let it settle, "
+            "then press Enter..."
         )
-        sensor.tare(args.samples)
-        input(
-            f"Apply the {args.known_mass_kg * 1000.0:.1f} g mass along the "
-            "positive sensing axis without changing orientation. Let it "
-            "settle, then press Enter..."
-        )
-        sensor.calibrate(args.known_mass_kg, args.samples)
-        input(
-            "Remove the calibration mass. The remaining orientation samples "
-            "must have no contact force. Press Enter to open the camera..."
-        )
+        tare_reading = sensor.average_raw(args.samples)
+        raw_values.append(tare_reading)
+        records.append({"mass_kg": 0.0, "raw_adc_average": tare_reading})
+        print(f"Zero-weight average raw ADC={tare_reading:.1f}")
 
-        tracker = open_human_charuco_tracker()
-        (
-            zed,
-            runtime_params,
-            image_zed,
-            camera_matrix,
-            dist_coeffs,
-            board,
-            detector,
-            config,
-        ) = tracker
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        print(
-            "\nMove the unloaded tool through varied roll, pitch, and yaw. "
-            "At each orientation hold it still and press C. Press Q to cancel."
-        )
-
-        while len(rotations) < args.orientations:
-            image = get_image(zed, runtime_params, image_zed)
-            if image is None:
-                continue
-            pose, detection, display = detect_human_marker_pose(
-                image, board, detector, camera_matrix, dist_coeffs
-            )
-            status = (
-                f"samples {len(rotations)}/{args.orientations} | "
-                f"corners {detection.num_charuco_corners}/4 | "
-                + ("C capture" if pose is not None else "pose unavailable")
-            )
-            cv2.putText(
-                display,
-                status,
-                (20, 35),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.75,
-                (0, 255, 0) if pose is not None else (0, 0, 255),
-                2,
-                cv2.LINE_AA,
-            )
-            cv2.imshow(window_name, display)
-            key = cv2.waitKeyEx(1) & 0xFF
-            if key in (ord("q"), 27):
-                raise RuntimeError("Human force calibration cancelled")
-            if key != ord("c") or pose is None:
-                continue
-
-            print(
-                f"Hold still: collecting orientation "
-                f"{len(rotations) + 1}/{args.orientations}..."
+        for index, mass in enumerate(masses, start=1):
+            input(
+                f"Apply {mass * 1000.0:.1f} g along the positive sensing "
+                f"axis ({index}/{masses.size}) without changing the sensor "
+                "position. Let it settle, then press Enter..."
             )
             raw_average = sensor.average_raw(args.samples)
-            rotation = pose.rotation_matrix.copy()
-            rotations.append(rotation)
             raw_values.append(raw_average)
             records.append(
                 {
-                    "T_camera_marker": pose.T_camera_board.tolist(),
+                    "mass_kg": float(mass),
                     "raw_adc_average": raw_average,
-                    "mean_reprojection_error_px": pose.mean_reprojection_error_px,
-                    "charuco_corners": detection.num_charuco_corners,
                 }
             )
-            print(f"Accepted orientation; average raw ADC={raw_average:.1f}")
+            print(f"Accepted {mass * 1000.0:.1f} g; raw ADC={raw_average:.1f}")
 
-        fit_human_orientation_model(
-            sensor.calibration, np.asarray(rotations), np.asarray(raw_values)
+        fit_human_weight_model(
+            sensor.calibration,
+            np.concatenate(([0.0], masses)),
+            np.asarray(raw_values),
         )
         sensor.save_calibration(args.calibration_file)
-        args.gravity_data_file.parent.mkdir(parents=True, exist_ok=True)
-        args.gravity_data_file.write_text(
+        args.weight_data_file.parent.mkdir(parents=True, exist_ok=True)
+        args.weight_data_file.write_text(
             json.dumps(
                 {
                     "calibration": asdict(sensor.calibration),
-                    "board": asdict(config),
                     "records": records,
                 },
                 indent=2,
@@ -1252,21 +1125,14 @@ def run_human_calibration(args: argparse.Namespace) -> None:
         )
         result = sensor.calibration
         print(
-            "\nHuman full calibration finished:\n"
+            "\nHuman multi-weight calibration finished:\n"
             f"  Counts/newton: {result.counts_per_newton:.6f}\n"
-            f"  Estimated supported mass: "
-            f"{result.estimated_payload_mass_kg * 1000.0:.1f} g\n"
-            f"  Orientation-fit RMSE: {result.gravity_fit_rmse_newtons:.4f} N\n"
+            f"  Fitted tare offset: {result.tare_offset:.3f} counts\n"
+            f"  Scale-fit RMSE: {result.scale_fit_rmse_newtons:.4f} N\n"
             f"  Calibration: {args.calibration_file}\n"
-            f"  Orientation data: {args.gravity_data_file}"
+            f"  Weight data: {args.weight_data_file}"
         )
     finally:
-        try:
-            cv2.destroyAllWindows()
-        except cv2.error:
-            pass
-        if zed is not None:
-            zed.close()
         if sensor is not None:
             sensor.disconnect()
 
@@ -1510,7 +1376,7 @@ def run_robot_read(args: argparse.Namespace) -> None:
 
 
 def run_human_read(args: argparse.Namespace) -> None:
-    """Use ChArUco orientation to print gravity-compensated human force."""
+    """Print human-sensor force using its multi-weight scale calibration."""
     if args.samples <= 0:
         raise ValueError("--samples must be positive")
     if args.print_rate <= 0.0:
@@ -1518,117 +1384,32 @@ def run_human_read(args: argparse.Namespace) -> None:
     if not args.calibration_file.exists():
         raise FileNotFoundError(f"Calibration not found: {args.calibration_file}")
 
-    import cv2
-
-    from camera import get_image
-
     sensor: ForceSensor | None = None
-    zed = None
-    window_name = "Human force sensor tracking"
     try:
         sensor = connect_sensor(args)
         sensor.load_calibration(args.calibration_file)
-        if not sensor.calibration.has_orientation_model:
-            raise RuntimeError(
-                "Calibration has no human orientation model; run "
-                "'calibrate human' first"
-            )
-
-        tracker = open_human_charuco_tracker()
-        (
-            zed,
-            runtime_params,
-            image_zed,
-            camera_matrix,
-            dist_coeffs,
-            board,
-            detector,
-            _,
-        ) = tracker
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-
-        runtime_adc_shift = 0.0
         if args.session_zero:
             input(
-                "Hold the unloaded tool still with the marker visible, then "
-                "press Enter for the session zero check..."
+                "Remove all loads, keep the sensor in its working position, "
+                "then press Enter to retare for this session..."
             )
-            pose = None
-            while pose is None:
-                image = get_image(zed, runtime_params, image_zed)
-                if image is None:
-                    continue
-                pose, _, display = detect_human_marker_pose(
-                    image, board, detector, camera_matrix, dist_coeffs
-                )
-                cv2.imshow(window_name, display)
-                cv2.waitKeyEx(1)
-            observed = sensor.average_raw(args.samples)
-            predicted = sensor.calibration.predict_unloaded_adc_from_rotation(
-                pose.rotation_matrix
-            )
-            runtime_adc_shift = observed - predicted
-            print(
-                f"Session zero correction: {runtime_adc_shift:.1f} ADC counts "
-                f"({runtime_adc_shift / sensor.counts_per_newton:.4f} N)"
-            )
+            sensor.tare(args.samples)
 
         print("\nRaw ADC | Force\nPress Ctrl+C to stop.\n")
         print_period = 1.0 / args.print_rate
         next_print = time.monotonic()
         while True:
-            image = get_image(zed, runtime_params, image_zed)
-            if image is None:
-                continue
-            pose, detection, display = detect_human_marker_pose(
-                image, board, detector, camera_matrix, dist_coeffs
-            )
-            status = (
-                f"corners {detection.num_charuco_corners}/4 | "
-                + ("tracking" if pose is not None else "pose unavailable")
-            )
-            cv2.putText(
-                display,
-                status,
-                (20, 35),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.75,
-                (0, 255, 0) if pose is not None else (0, 0, 255),
-                2,
-                cv2.LINE_AA,
-            )
-            cv2.imshow(window_name, display)
-            key = cv2.waitKeyEx(1) & 0xFF
-            if key in (ord("q"), 27):
-                break
-            if pose is None:
-                continue
-
             sample = sensor.read(timeout_seconds=2.0)
-            predicted_unloaded_adc = (
-                sensor.calibration.predict_unloaded_adc_from_rotation(
-                    pose.rotation_matrix
-                )
-                + runtime_adc_shift
-            )
-            force_newtons = (
-                sample.raw_adc - predicted_unloaded_adc
-            ) / sensor.counts_per_newton
             now = time.monotonic()
             if now >= next_print:
                 next_print = now + print_period
                 print(
-                    f"{sample.raw_adc:10.0f} | {force_newtons:9.4f} N"
+                    f"{sample.raw_adc:10.0f} | "
+                    f"{sample.force_newtons:9.4f} N"
                 )
     except KeyboardInterrupt:
         print("\nStopping human force-sensor reading.")
     finally:
-        try:
-            cv2.destroyAllWindows()
-        except cv2.error:
-            pass
-        if zed is not None:
-            zed.close()
         if sensor is not None:
             sensor.disconnect()
 
