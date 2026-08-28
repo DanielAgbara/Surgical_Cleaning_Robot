@@ -1,79 +1,8 @@
-# ----------------------------------
-# Python
-# ----------------------------------
+build/
+install/
+log/
+
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
 
-# ----------------------------------
-# Virtual Environments
-# ----------------------------------
-venv/
-.venv/
-env/
-
-# ----------------------------------
-# Large installers/packages
-# ----------------------------------
-*.whl
-Miniconda3-latest-Linux-x86_64.sh
-
-# ----------------------------------
-# Datasets
-# ----------------------------------
-data/
-Fine_Tuning/data/
-
-# ----------------------------------
-# Images
-# ----------------------------------
-*.jpg
-*.jpeg
-*.png
-*.bmp
-*.tif
-*.tiff
-*.webp
-
-# ----------------------------------
-# Videos
-# ----------------------------------
-*.mp4
-*.avi
-*.mov
-*.mkv
-
-# ----------------------------------
-# Training outputs
-# ----------------------------------
-events.out.tfevents*
-metrics.json
-last_checkpoint
-
-# Ignore all checkpoints
-*.pth
-
-# Keep only these two
-!Fine_Tuning/output/maskrcnn_tray/model_0000499.pth
-!Fine_Tuning/output/maskrcnn_tray/model_final.pth
-
-# ----------------------------------
-# Evaluation outputs
-# ----------------------------------
-Fine_Tuning/output/**/eval/
-
-# ----------------------------------
-# Private keys
-# ----------------------------------
-calibration/private_key
-calibration/private_key.pub
-*.pem
-*.key
-id_rsa*
-
-# ----------------------------------
-# OS files
-# ----------------------------------
-.DS_Store
-Thumbs.db
+.vscode/
