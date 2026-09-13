@@ -6,3 +6,4 @@ __pycache__/
 *.pyc
 
 .vscode/
+src/cleaning_robot_perception/models/maskrcnn_tray/model_final.pth

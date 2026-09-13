@@ -1,0 +1,37 @@
+{
+  "description": {
+    "summary": "Fixed pose of the cleaning-head center in the detected ChArUco marker frame.",
+    "transform": "T_marker_cleaning_head",
+    "mapping": "p_marker = T_marker_cleaning_head @ p_cleaning_head",
+    "matrix_layout": "4x4 homogeneous transform",
+    "translation_units": "meters",
+    "axis_definition": "Cleaning +X right, with +Y back and +Z down before the additional X rotation; positive X rotation is counterclockwise when viewed from marker +X toward the marker origin.",
+    "construction": "T_marker_cleaning_head = inverse([Rx(rotation_deg) @ Rx(pi), translation_cleaning_head_to_marker])"
+  },
+  "data": [
+    [
+      1.0,
+      0.0,
+      0.0,
+      0.05
+    ],
+    [
+      0.0,
+      0.8660254037844386,
+      -0.5,
+      -0.0025384757729336876
+    ],
+    [
+      0.0,
+      0.5,
+      0.8660254037844386,
+      0.12439676901250381
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ]
+}
